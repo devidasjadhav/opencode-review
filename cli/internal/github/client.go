@@ -1,9 +1,13 @@
 package github
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	gogithub "github.com/google/go-github/v67/github"
@@ -242,4 +246,71 @@ func EnsureOpenPR(ctx context.Context, gh *gogithub.Client, owner, repo, repoRoo
 		return 0, false, fmt.Errorf("failed to create PR for branch %q: %w", branch, err2)
 	}
 	return pr.GetNumber(), true, nil
+}
+
+// issueLocRe parses "[Severity] file:startLine[-endLine] — title" from issue titles.
+var issueLocRe = regexp.MustCompile(`\]\s+(\S+):(\d+)`)
+
+// IssueValidity reports whether a GitHub issue is still applicable to the current code.
+type IssueValidity struct {
+	Number  int
+	Title   string
+	Valid   bool
+	Reason  string
+}
+
+// ValidateIssues checks each open opencode-review issue against the current codebase.
+// An issue is considered stale if its reported file no longer exists or the reported
+// start line no longer exists in the file.
+func ValidateIssues(ctx context.Context, gh *gogithub.Client, owner, repo, repoRoot string) ([]IssueValidity, error) {
+	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	var results []IssueValidity
+	for _, issue := range issues {
+		body := issue.GetBody()
+		if !strings.Contains(body, "_Reported by opencode-review_") {
+			continue
+		}
+		v := IssueValidity{Number: issue.GetNumber(), Title: issue.GetTitle()}
+
+		m := issueLocRe.FindStringSubmatch(issue.GetTitle())
+		if m == nil {
+			v.Valid = true
+			v.Reason = "no location in title — assuming still valid"
+			results = append(results, v)
+			continue
+		}
+
+		relFile := m[1]
+		startLine, _ := strconv.Atoi(m[2])
+
+		absFile := filepath.Join(repoRoot, relFile)
+		f, err := os.Open(absFile)
+		if err != nil {
+			v.Valid = false
+			v.Reason = fmt.Sprintf("file %q no longer exists", relFile)
+			results = append(results, v)
+			continue
+		}
+
+		lineCount := 0
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			lineCount++
+		}
+		f.Close()
+
+		if startLine > lineCount {
+			v.Valid = false
+			v.Reason = fmt.Sprintf("reported line %d exceeds current file length (%d lines)", startLine, lineCount)
+		} else {
+			v.Valid = true
+			v.Reason = fmt.Sprintf("file exists and line %d is present (%d lines total)", startLine, lineCount)
+		}
+		results = append(results, v)
+	}
+	return results, nil
 }

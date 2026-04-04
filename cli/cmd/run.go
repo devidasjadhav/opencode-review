@@ -36,6 +36,7 @@ func Run() {
 	loopInterval := flag.Duration("loop-interval", 30*time.Second, "Wait between loop iterations")
 	baseBranch := flag.String("base", "master", "Base branch for auto-created PRs")
 	createBranch := flag.Bool("create-branch", false, "Create a new fix branch from current HEAD and push before opening PR")
+	validateIssues := flag.Bool("validate-issues", false, "Check open issues against current code and close stale ones before fixing")
 	flag.Parse()
 
 	dir := *dirFlag
@@ -110,6 +111,27 @@ func Run() {
 				fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
 			}
 		}
+	}
+
+	// Validate open issues against current codebase before proceeding.
+	if *validateIssues && ghClient != nil {
+		fmt.Println("Validating open issues against current codebase...")
+		validations, verr := gh.ValidateIssues(ctx, ghClient, ghOwner, ghRepo, repoRoot)
+		if verr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: issue validation failed: %v\n", verr)
+		} else {
+			for _, v := range validations {
+				if v.Valid {
+					fmt.Printf("  #%d ✓ %s\n    %s\n", v.Number, v.Title, v.Reason)
+				} else {
+					fmt.Printf("  #%d ✗ STALE — %s\n    Closing: %s\n", v.Number, v.Title, v.Reason)
+					comment := fmt.Sprintf("Closing as stale: %s", v.Reason)
+					_ = gh.CommentOnIssue(ctx, ghClient, ghOwner, ghRepo, v.Number, comment)
+					_ = gh.CloseIssue(ctx, ghClient, ghOwner, ghRepo, v.Number)
+				}
+			}
+		}
+		fmt.Println()
 	}
 
 	models, err := occ.ListModels(client, ctx, repoRoot)
