@@ -181,34 +181,60 @@ func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir
 }
 
 func postGitHubPRReview(repoRoot, body, verdict string) error {
-	// Detect PR number for current branch via gh CLI
-	prJSON, err := gitRun(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil {
-		return fmt.Errorf("cannot get branch: %w", err)
-	}
-	_ = prJSON // branch name, used implicitly by gh
-
-	// Determine gh review event from verdict
-	event := "COMMENT"
+	// Try the matching review type; fall back to --comment if GitHub rejects it
+	// (e.g. you cannot approve/request-changes on your own PR).
+	reviewFlag := "--comment"
 	switch {
-	case strings.Contains(verdict, "APPROVE"):
-		event = "APPROVE"
 	case strings.Contains(verdict, "REQUEST CHANGES"):
-		event = "REQUEST_CHANGES"
+		reviewFlag = "--request-changes"
+	case strings.Contains(verdict, "APPROVE"):
+		reviewFlag = "--approve"
 	}
 
-	cmd := exec.Command("gh", "pr", "review", "--body", body, "--"+strings.ToLower(strings.ReplaceAll(event, "_", "-")))
+	cmd := exec.Command("gh", "pr", "review", reviewFlag, "--body", body)
 	cmd.Dir = repoRoot
+	var errBuf bytes.Buffer
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	cmd.Stderr = &errBuf
+
+	if err := cmd.Run(); err != nil {
+		// GitHub rejects approve/request-changes on own PRs — retry as comment
+		if reviewFlag != "--comment" && strings.Contains(errBuf.String(), "own pull request") {
+			fmt.Fprintln(os.Stderr, "(falling back to --comment: cannot approve/request-changes own PR)")
+			cmd2 := exec.Command("gh", "pr", "review", "--comment", "--body", body)
+			cmd2.Dir = repoRoot
+			cmd2.Stdout = os.Stdout
+			cmd2.Stderr = os.Stderr
+			return cmd2.Run()
+		}
+		fmt.Fprint(os.Stderr, errBuf.String())
+		return err
+	}
+	return nil
 }
 
 func extractVerdict(review string) string {
+	// Only parse the ## Verdict section to avoid false matches in findings/summary.
+	inVerdict := false
 	for _, line := range strings.Split(review, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "APPROVE") || strings.Contains(line, "REQUEST CHANGES") || strings.Contains(line, "COMMENT") {
-			return line
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## Verdict") {
+			inVerdict = true
+			continue
+		}
+		if inVerdict {
+			if strings.HasPrefix(trimmed, "##") {
+				break // next section
+			}
+			if strings.Contains(trimmed, "REQUEST CHANGES") {
+				return "REQUEST CHANGES"
+			}
+			if strings.Contains(trimmed, "APPROVE") {
+				return "APPROVE"
+			}
+			if strings.Contains(trimmed, "COMMENT") {
+				return "COMMENT"
+			}
 		}
 	}
 	return "COMMENT"
