@@ -75,6 +75,9 @@ func Run() {
 			os.Exit(1)
 		}
 		fmt.Printf("Created and pushed branch %q\n", newBranch)
+		// Switch to audit mode: the branch has no commit diff to review,
+		// so we need a full codebase audit to find and fix existing issues.
+		*auditMode = true
 	}
 
 	// GitHub client — required for --pr, --issues, --loop, --merge, --validate-issues
