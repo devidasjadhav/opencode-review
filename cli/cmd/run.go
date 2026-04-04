@@ -35,6 +35,7 @@ func Run() {
 	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
 	loopInterval := flag.Duration("loop-interval", 30*time.Second, "Wait between loop iterations")
 	baseBranch := flag.String("base", "master", "Base branch for auto-created PRs")
+	createBranch := flag.Bool("create-branch", false, "Create a new fix branch from current HEAD and push before opening PR")
 	flag.Parse()
 
 	dir := *dirFlag
@@ -56,6 +57,25 @@ func Run() {
 
 	client := occ.NewClient(*serverURL)
 	ctx := context.Background()
+
+	// Create and push a new fix branch if requested.
+	if *createBranch {
+		newBranch := fmt.Sprintf("fix/opencode-%s", time.Now().Format("20060102-150405"))
+		if _, err := git.Run(repoRoot, "checkout", "-b", newBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create branch %q: %v\n", newBranch, err)
+			os.Exit(1)
+		}
+		// Create an empty commit so GitHub allows PR creation against base.
+		if _, err := git.Run(repoRoot, "commit", "--allow-empty", "-m", "chore: open fix branch for opencode-review"); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create empty commit: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := git.Run(repoRoot, "push", "-u", "origin", newBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to push branch %q: %v\n", newBranch, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Created and pushed branch %q\n", newBranch)
+	}
 
 	// GitHub client — required for --pr, --issues, --loop, --merge
 	var ghClient *gogithub.Client
