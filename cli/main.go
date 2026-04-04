@@ -16,6 +16,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/oauth2"
+
+	"github.com/google/go-github/v67/github"
 	opencode "github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
 )
@@ -298,21 +301,44 @@ func extractVerdict(review string) string {
 	return "COMMENT"
 }
 
-// ── GitHub helpers ────────────────────────────────────────────────────────────
+// ── GitHub client ─────────────────────────────────────────────────────────────
 
-func ghRun(dir string, args ...string) (string, error) {
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = dir
-	var out, errBuf bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("gh %s: %w\n%s", strings.Join(args, " "), err, errBuf.String())
+// ghClient builds a GitHub API client from GITHUB_TOKEN env var.
+func ghClient(ctx context.Context) (*github.Client, error) {
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		return nil, fmt.Errorf("GITHUB_TOKEN environment variable not set")
 	}
-	return strings.TrimSpace(out.String()), nil
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+	return github.NewClient(oauth2.NewClient(ctx, ts)), nil
 }
 
-func createIssue(repoRoot string, f Finding) (int, error) {
+// repoOwnerName parses "owner" and "repo" from `git remote get-url origin`.
+func repoOwnerName(repoRoot string) (owner, repo string, err error) {
+	out, err := gitRun(repoRoot, "remote", "get-url", "origin")
+	if err != nil {
+		return "", "", fmt.Errorf("cannot read git remote: %w", err)
+	}
+	// Handles https://github.com/owner/repo.git and git@github.com:owner/repo.git
+	out = strings.TrimSuffix(out, ".git")
+	if idx := strings.Index(out, "github.com/"); idx >= 0 {
+		parts := strings.SplitN(out[idx+len("github.com/"):], "/", 2)
+		if len(parts) == 2 {
+			return parts[0], parts[1], nil
+		}
+	}
+	if idx := strings.Index(out, "github.com:"); idx >= 0 {
+		parts := strings.SplitN(out[idx+len("github.com:"):], "/", 2)
+		if len(parts) == 2 {
+			return parts[0], parts[1], nil
+		}
+	}
+	return "", "", fmt.Errorf("cannot parse GitHub owner/repo from remote %q", out)
+}
+
+// ── GitHub helpers ────────────────────────────────────────────────────────────
+
+func createIssue(ctx context.Context, gh *github.Client, owner, repo string, f Finding) (int, error) {
 	title := fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
 	var body strings.Builder
 	fmt.Fprintf(&body, "## %s\n\n", f.Title)
@@ -322,8 +348,7 @@ func createIssue(repoRoot string, f Finding) (int, error) {
 	body.WriteString(strings.TrimSpace(f.Description))
 	body.WriteString("\n\n")
 	if f.Diff != "" {
-		body.WriteString("### Suggested fix\n")
-		body.WriteString("```diff\n")
+		body.WriteString("### Suggested fix\n```diff\n")
 		body.WriteString(f.Diff)
 		body.WriteString("\n```\n\n")
 	}
@@ -334,109 +359,147 @@ func createIssue(repoRoot string, f Finding) (int, error) {
 	}
 	body.WriteString("\n---\n_Reported by opencode-review_\n")
 
-	out, err := ghRun(repoRoot, "issue", "create",
-		"--title", title,
-		"--body", body.String(),
-	)
+	bodyStr := body.String()
+	issue, _, err := gh.Issues.Create(ctx, owner, repo, &github.IssueRequest{
+		Title: &title,
+		Body:  &bodyStr,
+	})
 	if err != nil {
 		return 0, err
 	}
-	// Output is the issue URL, parse number from end
-	parts := strings.Split(strings.TrimRight(out, "/"), "/")
-	num, err := strconv.Atoi(parts[len(parts)-1])
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse issue number from %q", out)
-	}
-	return num, nil
+	return issue.GetNumber(), nil
 }
 
-func closeIssue(repoRoot string, num int) error {
-	_, err := ghRun(repoRoot, "issue", "close", strconv.Itoa(num), "--comment", "Fixed and merged. Closing.")
+func closeIssue(ctx context.Context, gh *github.Client, owner, repo string, num int) error {
+	comment := "Fixed and merged. Closing."
+	if _, _, err := gh.Issues.CreateComment(ctx, owner, repo, num, &github.IssueComment{Body: &comment}); err != nil {
+		return err
+	}
+	state := "closed"
+	_, _, err := gh.Issues.Edit(ctx, owner, repo, num, &github.IssueRequest{State: &state})
 	return err
 }
 
-func linkIssuesToPR(repoRoot string, issueNums []int) error {
+// existingIssues fetches open issue titles from GitHub for deduplication.
+func existingIssues(ctx context.Context, gh *github.Client, owner, repo string) map[string]bool {
+	seen := map[string]bool{}
+	opts := &github.IssueListByRepoOptions{State: "open", ListOptions: github.ListOptions{PerPage: 100}}
+	for {
+		issues, resp, err := gh.Issues.ListByRepo(ctx, owner, repo, opts)
+		if err != nil {
+			return seen
+		}
+		for _, issue := range issues {
+			if issue.PullRequestLinks == nil { // skip PRs
+				seen[issue.GetTitle()] = true
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return seen
+}
+
+func linkIssuesToPR(ctx context.Context, gh *github.Client, owner, repo string, prNum int, issueNums []int) error {
 	if len(issueNums) == 0 {
 		return nil
+	}
+	pr, _, err := gh.PullRequests.Get(ctx, owner, repo, prNum)
+	if err != nil {
+		return err
 	}
 	var closes []string
 	for _, n := range issueNums {
 		closes = append(closes, fmt.Sprintf("Closes #%d", n))
 	}
-	body, err := ghRun(repoRoot, "pr", "view", "--json", "body", "--jq", ".body")
-	if err != nil {
-		return err
-	}
-	// Append closes if not already there
-	newBody := body + "\n\n" + strings.Join(closes, "\n")
-	_, err = ghRun(repoRoot, "pr", "edit", "--body", newBody)
+	newBody := pr.GetBody() + "\n\n" + strings.Join(closes, "\n")
+	_, _, err = gh.PullRequests.Edit(ctx, owner, repo, prNum, &github.PullRequest{Body: &newBody})
 	return err
 }
 
-func postGitHubPRReview(repoRoot, body, verdict string) error {
-	reviewFlag := "--comment"
+func postGitHubPRReview(ctx context.Context, gh *github.Client, owner, repo string, prNum int, body, verdict string) error {
+	event := "COMMENT"
 	switch {
 	case strings.Contains(verdict, "REQUEST CHANGES"):
-		reviewFlag = "--request-changes"
+		event = "REQUEST_CHANGES"
 	case strings.Contains(verdict, "APPROVE"):
-		reviewFlag = "--approve"
+		event = "APPROVE"
 	}
 
-	cmd := exec.Command("gh", "pr", "review", reviewFlag, "--body", body)
-	cmd.Dir = repoRoot
-	var errBuf bytes.Buffer
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = &errBuf
-
-	if err := cmd.Run(); err != nil {
-		if reviewFlag != "--comment" && strings.Contains(errBuf.String(), "own pull request") {
-			fmt.Fprintln(os.Stderr, "(falling back to --comment: cannot approve/request-changes own PR)")
-			cmd2 := exec.Command("gh", "pr", "review", "--comment", "--body", body)
-			cmd2.Dir = repoRoot
-			cmd2.Stdout = os.Stdout
-			cmd2.Stderr = os.Stderr
-			return cmd2.Run()
+	_, _, err := gh.PullRequests.CreateReview(ctx, owner, repo, prNum, &github.PullRequestReviewRequest{
+		Body:  &body,
+		Event: &event,
+	})
+	if err != nil && event != "COMMENT" {
+		// Cannot approve/request-changes on own PR — fall back to comment
+		if strings.Contains(err.Error(), "Can not approve your own") ||
+			strings.Contains(err.Error(), "own pull request") {
+			fmt.Fprintln(os.Stderr, "(falling back to COMMENT: cannot approve/request-changes own PR)")
+			comment := "COMMENT"
+			_, _, err = gh.PullRequests.CreateReview(ctx, owner, repo, prNum, &github.PullRequestReviewRequest{
+				Body:  &body,
+				Event: &comment,
+			})
 		}
-		fmt.Fprint(os.Stderr, errBuf.String())
+	}
+	return err
+}
+
+func mergePR(ctx context.Context, gh *github.Client, owner, repo string, prNum int, strategy string, deleteBranch bool) error {
+	method := map[string]string{"merge": "merge", "squash": "squash", "rebase": "rebase"}[strategy]
+	if method == "" {
+		return fmt.Errorf("invalid merge strategy %q: must be merge, squash, or rebase", strategy)
+	}
+	_, _, err := gh.PullRequests.Merge(ctx, owner, repo, prNum, "", &github.PullRequestOptions{
+		MergeMethod: method,
+	})
+	if err != nil {
 		return err
+	}
+	if deleteBranch {
+		pr, _, err2 := gh.PullRequests.Get(ctx, owner, repo, prNum)
+		if err2 == nil && pr.Head != nil && pr.Head.Ref != nil {
+			gh.Git.DeleteRef(ctx, owner, repo, "heads/"+pr.Head.GetRef()) //nolint
+		}
 	}
 	return nil
 }
 
-func mergePR(repoRoot, strategy string, deleteBranch bool) error {
-	var strategyFlag string
-	switch strategy {
-	case "merge":
-		strategyFlag = "--merge"
-	case "squash":
-		strategyFlag = "--squash"
-	case "rebase":
-		strategyFlag = "--rebase"
-	default:
-		return fmt.Errorf("invalid merge strategy %q: must be merge, squash, or rebase", strategy)
+// openPRNumber returns the number of the open PR for the current branch.
+func openPRNumber(ctx context.Context, gh *github.Client, owner, repo, repoRoot string) (int, error) {
+	branch, err := gitRun(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return 0, err
 	}
-	args := []string{"pr", "merge", strategyFlag}
-	if deleteBranch {
-		args = append(args, "--delete-branch")
+	// Resolve the authenticated user's login for the head filter (handles orgs and forks).
+	headUser := owner
+	if me, _, err2 := gh.Users.Get(ctx, ""); err2 == nil {
+		headUser = me.GetLogin()
 	}
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = repoRoot
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	prs, _, err := gh.PullRequests.List(ctx, owner, repo, &github.PullRequestListOptions{
+		State: "open", Head: headUser + ":" + branch,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(prs) == 0 {
+		return 0, fmt.Errorf("no open PR found for branch %q", branch)
+	}
+	return prs[0].GetNumber(), nil
 }
 
 // ── Opencode stream ───────────────────────────────────────────────────────────
 
 func runReview(client *opencode.Client, ctx context.Context, repoRoot string, selected ModelInfo,
-	hash, subject, body, diff string) string {
+	hash, subject, body, diff string) (string, error) {
 
 	session, err := client.Session.New(ctx, opencode.SessionNewParams{
 		Directory: opencode.F(repoRoot),
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating session: %v\n", err)
-		os.Exit(1)
+		return "", fmt.Errorf("error creating session: %w", err)
 	}
 	sessionID := session.ID
 	// Clean up session when review is done to avoid orphan sessions in loop mode.
@@ -465,10 +528,13 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 					} `json:"properties"`
 				}
 				if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &envelope); err == nil {
-					if envelope.Properties.Field == "text" && envelope.Properties.Delta != "" {
+					switch envelope.Properties.Field {
+					case "text":
 						fmt.Print(envelope.Properties.Delta)
 						buf.WriteString(envelope.Properties.Delta)
-					}
+					case "reasoning":
+						// Suppress reasoning/thinking tokens from output and parsing
+}
 				}
 			case opencode.EventListResponseTypeSessionIdle:
 				idle, ok := event.AsUnion().(opencode.EventListResponseEventSessionIdle)
@@ -484,6 +550,7 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 		}
 		if err := stream.Err(); err != nil && streamCtx.Err() == nil {
 			fmt.Fprintf(os.Stderr, "\nStream error: %v\n", err)
+			idleCh <- "" // unblock caller so it doesn't hang
 		}
 	}()
 
@@ -502,10 +569,9 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 		}),
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error sending prompt: %v\n", err)
-		os.Exit(1)
+		return "", fmt.Errorf("error sending prompt: %w", err)
 	}
-	return <-idleCh
+	return <-idleCh, nil
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -545,6 +611,32 @@ func main() {
 	client := opencode.NewClient(option.WithBaseURL(*serverURL))
 	ctx := context.Background()
 
+	// GitHub client (required for --pr, --issues, --merge, --loop)
+	var gh *github.Client
+	var ghOwner, ghRepo string
+	var ghPRNum int
+	if *postPR || *createIssues || *loopMode || *mergeOnApprove {
+		var err error
+		gh, err = ghClient(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "GitHub: %v\n", err)
+			os.Exit(1)
+		}
+		ghOwner, ghRepo, err = repoOwnerName(repoRoot)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "GitHub: %v\n", err)
+			os.Exit(1)
+		}
+		if *postPR || *loopMode || *mergeOnApprove {
+			ghPRNum, err = openPRNumber(ctx, gh, ghOwner, ghRepo, repoRoot)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "GitHub PR: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+		}
+	}
+
 	models, err := listModels(client, ctx, repoRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching models: %v\n", err)
@@ -569,9 +661,31 @@ func main() {
 		*loopInterval = 0
 	}
 
-	// Track open issues across loop iterations (deduplicated by finding key)
+	// Ensure logs directory exists
+	logsDir := filepath.Join(repoRoot, "logs")
+	_ = os.MkdirAll(logsDir, 0o755)
+	logFile := filepath.Join(logsDir, fmt.Sprintf("review-%s.jsonl", time.Now().Format("20060102-150405")))
+	logF, logErr := os.Create(logFile)
+	if logErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: cannot create log file: %v\n", logErr)
+		logF = nil
+	}
+	writeLog := func(record any) {
+		if logF == nil {
+			return
+		}
+		b, _ := json.Marshal(record)
+		logF.Write(b)
+		logF.Write([]byte("\n"))
+	}
+	defer func() {
+		if logF != nil {
+			logF.Close()
+		}
+	}()
+
+	// Track open issues across loop iterations (deduplicated via GitHub API)
 	var openIssues []int
-	seenFindings := map[string]bool{} // key: "file:line:title"
 	iteration := 0
 
 	for {
@@ -590,30 +704,55 @@ func main() {
 		fmt.Printf("─── Iteration %d — reviewing %s\n  %s\n\n", iteration, hash[:12], subject)
 		fmt.Println("--- Code Review ---\n")
 
-		reviewText := runReview(client, ctx, repoRoot, selected, hash, subject, body, diff)
+		reviewText, err := runReview(client, ctx, repoRoot, selected, hash, subject, body, diff)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Review failed: %v\n", err)
+			os.Exit(1)
+		}
 		verdict := extractVerdict(reviewText)
 
 		// Post PR review comment
 		if *postPR && reviewText != "" {
 			fmt.Printf("Posting PR review (%s)...\n", verdict)
-			if err := postGitHubPRReview(repoRoot, reviewText, verdict); err != nil {
+			if err := postGitHubPRReview(ctx, gh, ghOwner, ghRepo, ghPRNum, reviewText, verdict); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to post PR review: %v\n", err)
 			} else {
 				fmt.Println("Posted.")
 			}
 		}
 
-		// Create GitHub issues for new findings only (deduplicated)
+		// Write per-iteration log entry
+		writeLog(map[string]any{
+			"ts":        time.Now().Format(time.RFC3339),
+			"iteration": iteration,
+			"commit":    hash,
+			"subject":   subject,
+			"verdict":   verdict,
+		})
+
+		// Create GitHub issues for new findings only (deduplicated via live issue list)
 		if *createIssues && reviewText != "" {
 			findings := parseFindings(reviewText)
+			ghSeen := existingIssues(ctx, gh, ghOwner, ghRepo)
 			var newIssues []int
 			for _, f := range findings {
-				key := fmt.Sprintf("%s:%s:%s", f.File, f.LineRange, f.Title)
-				if seenFindings[key] {
-					continue // already filed
+				ghTitle := fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
+				// Deduplicate: skip if an open issue already mentions this file+severity combination
+				alreadyFiled := false
+				if ghSeen != nil {
+					fileKey := fmt.Sprintf("[%s] %s", f.Severity, f.File)
+					for t := range ghSeen {
+						if strings.Contains(t, fileKey) {
+							alreadyFiled = true
+							break
+						}
+					}
 				}
-				seenFindings[key] = true
-				num, err := createIssue(repoRoot, f)
+				if alreadyFiled {
+					fmt.Printf("  Skipping (already open): %s\n", ghTitle)
+					continue
+				}
+				num, err := createIssue(ctx, gh, ghOwner, ghRepo, f)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "  Failed to create issue for %q: %v\n", f.Title, err)
 					continue
@@ -621,13 +760,25 @@ func main() {
 				fmt.Printf("  #%d [%s] %s:%s — %s\n", num, f.Severity, f.File, f.LineRange, f.Title)
 				newIssues = append(newIssues, num)
 				openIssues = append(openIssues, num)
+				if ghSeen != nil {
+					ghSeen[ghTitle] = true // prevent double-filing within same iteration
+				}
+				writeLog(map[string]any{
+					"ts":        time.Now().Format(time.RFC3339),
+					"action":    "issue_created",
+					"issue":     num,
+					"severity":  f.Severity,
+					"file":      f.File,
+					"lineRange": f.LineRange,
+					"title":     f.Title,
+				})
 			}
 			if len(newIssues) == 0 && len(findings) > 0 {
 				fmt.Println("  No new findings (all already tracked).")
 			}
 			// Link new issues to PR
 			if *postPR && len(newIssues) > 0 {
-				if err := linkIssuesToPR(repoRoot, newIssues); err != nil {
+				if err := linkIssuesToPR(ctx, gh, ghOwner, ghRepo, ghPRNum, newIssues); err != nil {
 					fmt.Fprintf(os.Stderr, "  Failed to link issues to PR: %v\n", err)
 				} else {
 					fmt.Println("  Issues linked to PR.")
@@ -648,22 +799,24 @@ func main() {
 				fmt.Fprintln(os.Stderr, "Refusing to merge: reviewed commit is not current HEAD.")
 				os.Exit(1)
 			}
-			if err := mergePR(repoRoot, *mergeStrategy, *deleteBranch); err != nil {
+			if err := mergePR(ctx, gh, ghOwner, ghRepo, ghPRNum, *mergeStrategy, *deleteBranch); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to merge: %v\n", err)
 				os.Exit(1)
 			}
 			fmt.Println("Merged.")
+			writeLog(map[string]any{"ts": time.Now().Format(time.RFC3339), "action": "pr_merged", "strategy": *mergeStrategy})
 
 			// Close all tracked issues; exit non-zero if any fail
 			var closeFailed bool
 			if len(openIssues) > 0 {
 				fmt.Printf("Closing %d issue(s)...\n", len(openIssues))
 				for _, n := range openIssues {
-					if err := closeIssue(repoRoot, n); err != nil {
+					if err := closeIssue(ctx, gh, ghOwner, ghRepo, n); err != nil {
 						fmt.Fprintf(os.Stderr, "  Failed to close #%d: %v\n", n, err)
 						closeFailed = true
 					} else {
 						fmt.Printf("  Closed #%d\n", n)
+						writeLog(map[string]any{"ts": time.Now().Format(time.RFC3339), "action": "issue_closed", "issue": n})
 					}
 				}
 			}
