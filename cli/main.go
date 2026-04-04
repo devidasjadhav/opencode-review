@@ -628,12 +628,19 @@ func main() {
 			os.Exit(1)
 		}
 		if *postPR || *loopMode || *mergeOnApprove {
+			// Fatal: PR is required for review posting, loop, and merge.
 			ghPRNum, err = openPRNumber(ctx, gh, ghOwner, ghRepo, repoRoot)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "GitHub PR: %v\n", err)
 				os.Exit(1)
 			}
 			fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+		} else if *createIssues {
+			// Non-fatal: try to find a PR for issue linking/commenting; continue without one.
+			if n, err2 := openPRNumber(ctx, gh, ghOwner, ghRepo, repoRoot); err2 == nil {
+				ghPRNum = n
+				fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+			}
 		}
 	}
 
@@ -753,6 +760,13 @@ func main() {
 				if ghSeen != nil {
 					ghSeen[ghTitle] = true // prevent double-filing within same iteration
 				}
+				// Comment on the issue referencing the PR (if one exists)
+				if ghPRNum > 0 {
+					prRef := fmt.Sprintf("Tracking in PR #%d.", ghPRNum)
+					if _, _, err2 := gh.Issues.CreateComment(ctx, ghOwner, ghRepo, num, &github.IssueComment{Body: &prRef}); err2 != nil {
+						fmt.Fprintf(os.Stderr, "  Warning: could not comment on issue #%d: %v\n", num, err2)
+					}
+				}
 				writeLog(map[string]any{
 					"ts":        time.Now().Format(time.RFC3339),
 					"action":    "issue_created",
@@ -766,8 +780,8 @@ func main() {
 			if len(newIssues) == 0 && len(findings) > 0 {
 				fmt.Println("  No new findings (all already tracked).")
 			}
-			// Link new issues to PR
-			if *postPR && len(newIssues) > 0 {
+			// Link new issues to PR (always when PR exists, not only when --pr is set)
+			if ghPRNum > 0 && len(newIssues) > 0 {
 				if err := linkIssuesToPR(ctx, gh, ghOwner, ghRepo, ghPRNum, newIssues); err != nil {
 					fmt.Fprintf(os.Stderr, "  Failed to link issues to PR: %v\n", err)
 				} else {
