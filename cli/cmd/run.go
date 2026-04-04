@@ -129,7 +129,8 @@ func Run() {
 		}
 
 		fmt.Printf("─── Iteration %d — reviewing %s\n  %s\n\n", iteration, hash[:12], subject)
-		fmt.Println("--- Code Review ---\n")
+		fmt.Println("--- Code Review ---")
+		fmt.Println()
 
 		var prompt string
 		if *auditMode {
@@ -181,7 +182,7 @@ func Run() {
 			break
 		}
 
-		if *mergeOnApprove {
+		if *mergeOnApprove && !*autoFix {
 			fmt.Fprintln(os.Stderr, "Not merging: verdict is not APPROVE.")
 			os.Exit(1)
 		}
@@ -220,7 +221,7 @@ func fileIssues(ctx context.Context, ghClient *gogithub.Client, owner, repo stri
 	var newIssues []int
 
 	for _, f := range findings {
-		ghTitle := fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
+		ghTitle := gh.FindingIssueTitle(f)
 		if ghSeen[ghTitle] {
 			fmt.Printf("  Skipping (already open): %s\n", ghTitle)
 			continue

@@ -2,6 +2,7 @@ package review
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,20 +72,29 @@ func BuildAuditPrompt(repoRoot string) (string, error) {
 	sb.WriteString("`REQUEST CHANGES` — violations must be fixed.\n\n")
 	sb.WriteString("---\n")
 
-	matches, err := filepath.Glob(filepath.Join(repoRoot, "cli", "*.go"))
+	err := filepath.WalkDir(filepath.Join(repoRoot, "cli"), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == "vendor" || d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(repoRoot, path)
+		fmt.Fprintf(&sb, "\n### File: %s\n```go\n%s\n```\n", rel, string(content))
+		return nil
+	})
 	if err != nil {
 		return "", err
-	}
-	for _, f := range matches {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		content, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		rel, _ := filepath.Rel(repoRoot, f)
-		fmt.Fprintf(&sb, "\n### File: %s\n```go\n%s\n```\n", rel, string(content))
 	}
 	return sb.String(), nil
 }

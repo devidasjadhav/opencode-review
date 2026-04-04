@@ -73,9 +73,14 @@ func ExistingIssueTitles(ctx context.Context, gh *gogithub.Client, owner, repo s
 	return seen
 }
 
+// FindingIssueTitle returns the canonical GitHub issue title for a finding.
+func FindingIssueTitle(f types.Finding) string {
+	return fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
+}
+
 // CreateIssue opens a new GitHub issue from a Finding and returns its number.
 func CreateIssue(ctx context.Context, gh *gogithub.Client, owner, repo string, f types.Finding) (int, error) {
-	title := fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
+	title := FindingIssueTitle(f)
 	var body strings.Builder
 	fmt.Fprintf(&body, "## %s\n\n", f.Title)
 	fmt.Fprintf(&body, "**Severity:** %s  \n", f.Severity)
