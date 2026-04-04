@@ -796,27 +796,26 @@ func main() {
 			fmt.Println("Merged.")
 			writeLog(map[string]any{"ts": time.Now().Format(time.RFC3339), "action": "pr_merged", "strategy": *mergeStrategy})
 
-			// Close all open issues (current run + any from previous runs on this repo)
+			// Close issues created by opencode-review (current run + previous runs).
+			// Only closes issues whose body ends with the opencode-review signature line
+			// to avoid touching unrelated human-tracked issues.
 			if *createIssues {
-				allOpen := existingIssues(ctx, gh, ghOwner, ghRepo)
-				// Merge in any created this run that may not yet appear in the API list
-				for _, n := range openIssues {
-					allOpen[fmt.Sprintf("__num_%d", n)] = true
-				}
-				// Build deduplicated close list: current-run nums + any open issues by number
 				closeNums := map[int]bool{}
 				for _, n := range openIssues {
 					closeNums[n] = true
 				}
-				// Also fetch open issues by number for ones not created this run
+				// Fetch open issues from previous runs (identified by signature footer)
 				opts := &github.IssueListByRepoOptions{State: "open", ListOptions: github.ListOptions{PerPage: 100}}
+				var listErr error
 				for {
 					issues, resp, err2 := gh.Issues.ListByRepo(ctx, ghOwner, ghRepo, opts)
 					if err2 != nil {
+						listErr = err2
 						break
 					}
 					for _, issue := range issues {
-						if issue.PullRequestLinks == nil {
+						if issue.PullRequestLinks == nil &&
+							strings.Contains(issue.GetBody(), "_Reported by opencode-review_") {
 							closeNums[issue.GetNumber()] = true
 						}
 					}
@@ -825,9 +824,13 @@ func main() {
 					}
 					opts.Page = resp.NextPage
 				}
+				if listErr != nil {
+					fmt.Fprintf(os.Stderr, "Failed to list open issues: %v\n", listErr)
+					os.Exit(1)
+				}
 				var closeFailed bool
 				if len(closeNums) > 0 {
-					fmt.Printf("Closing %d issue(s)...\n", len(closeNums))
+					fmt.Printf("Closing %d opencode-review issue(s)...\n", len(closeNums))
 					for n := range closeNums {
 						if err := closeIssue(ctx, gh, ghOwner, ghRepo, n); err != nil {
 							fmt.Fprintf(os.Stderr, "  Failed to close #%d: %v\n", n, err)
