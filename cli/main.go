@@ -628,12 +628,19 @@ func main() {
 			os.Exit(1)
 		}
 		if *postPR || *loopMode || *mergeOnApprove {
+			// Fatal: PR is required for review posting, loop, and merge.
 			ghPRNum, err = openPRNumber(ctx, gh, ghOwner, ghRepo, repoRoot)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "GitHub PR: %v\n", err)
 				os.Exit(1)
 			}
 			fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+		} else if *createIssues {
+			// Non-fatal: try to find a PR for issue linking/commenting; continue without one.
+			if n, err2 := openPRNumber(ctx, gh, ghOwner, ghRepo, repoRoot); err2 == nil {
+				ghPRNum = n
+				fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+			}
 		}
 	}
 
