@@ -1,2 +1,0 @@
-{"commit":"69f10fb8d7e6248f1c1fe6a3eb0f6dc353b31e0c","iteration":1,"subject":"fix: exact-title dedup for issues, PR head owner from auth user","ts":"2026-04-04T20:55:27+05:30","verdict":"APPROVE"}
-{"action":"pr_merged","strategy":"squash","ts":"2026-04-04T20:55:35+05:30"}

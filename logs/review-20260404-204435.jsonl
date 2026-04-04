@@ -1,2 +1,0 @@
-{"commit":"2984c4817f5d69a66f73daa455554edc358dc8d3","iteration":1,"subject":"feat: replace gh CLI with native GitHub API, fix session cleanup and stream hang","ts":"2026-04-04T20:45:50+05:30","verdict":"REQUEST CHANGES"}
-{"commit":"2984c4817f5d69a66f73daa455554edc358dc8d3","iteration":2,"subject":"feat: replace gh CLI with native GitHub API, fix session cleanup and stream hang","ts":"2026-04-04T20:47:41+05:30","verdict":"REQUEST CHANGES"}

@@ -1,2 +1,0 @@
-{"commit":"e09978d8307c181f57bf770ee753107561ec7b42","iteration":1,"subject":"fix: discover PR for --issues-only mode so linking and comments work","ts":"2026-04-04T21:20:13+05:30","verdict":"APPROVE"}
-{"action":"pr_merged","strategy":"squash","ts":"2026-04-04T21:20:21+05:30"}
