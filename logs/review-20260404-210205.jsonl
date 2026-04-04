@@ -1,0 +1,4 @@
+{"commit":"d471f1f3d88c25065b93cd398d978395aefc6fc5","iteration":1,"subject":"fix: close all open issues on approve, not just current-run ones","ts":"2026-04-04T21:03:09+05:30","verdict":"REQUEST CHANGES"}
+{"commit":"d471f1f3d88c25065b93cd398d978395aefc6fc5","iteration":2,"subject":"fix: close all open issues on approve, not just current-run ones","ts":"2026-04-04T21:04:41+05:30","verdict":"REQUEST CHANGES"}
+{"commit":"d471f1f3d88c25065b93cd398d978395aefc6fc5","iteration":3,"subject":"fix: close all open issues on approve, not just current-run ones","ts":"2026-04-04T21:06:12+05:30","verdict":"REQUEST CHANGES"}
+{"action":"issue_created","file":"cli/main.go","issue":46,"lineRange":"812-821","severity":"Critical","title":"Closes unrelated human-tracked issues across the repo","ts":"2026-04-04T21:06:14+05:30"}

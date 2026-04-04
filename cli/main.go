@@ -83,6 +83,52 @@ func getCommitInfo(root, ref string) (hash, subject, body, diff string, err erro
 	return
 }
 
+func gitStatusSnapshot(root string) (map[string]string, error) {
+	out, err := gitRun(root, "status", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	snapshot := map[string]string{}
+	if out == "" {
+		return snapshot, nil
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		status := line[:2]
+		path := strings.TrimSpace(line[3:])
+		if i := strings.Index(path, " -> "); i >= 0 {
+			path = path[i+4:]
+		}
+		snapshot[path] = status
+	}
+	return snapshot, nil
+}
+
+func isOperationalArtifact(path string) bool {
+	p := filepath.ToSlash(path)
+	return strings.HasPrefix(p, "logs/")
+}
+
+func fixerStagePaths(before, after map[string]string) []string {
+	var paths []string
+	for path, afterStatus := range after {
+		if isOperationalArtifact(path) {
+			continue
+		}
+		if strings.HasPrefix(afterStatus, "??") {
+			continue
+		}
+		beforeStatus, existed := before[path]
+		if !existed || beforeStatus != afterStatus {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
 // ── Model helpers ─────────────────────────────────────────────────────────────
 
 func listModels(client *opencode.Client, ctx context.Context, dir string) ([]ModelInfo, error) {
@@ -534,7 +580,7 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 						buf.WriteString(envelope.Properties.Delta)
 					case "reasoning":
 						// Suppress reasoning/thinking tokens from output and parsing
-}
+					}
 				}
 			case opencode.EventListResponseTypeSessionIdle:
 				idle, ok := event.AsUnion().(opencode.EventListResponseEventSessionIdle)
@@ -602,6 +648,11 @@ func runFix(client *opencode.Client, ctx context.Context, repoRoot string, selec
 		}
 	}
 	prompt := sb.String()
+	beforeStatus, err := gitStatusSnapshot(repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix status snapshot error: %v\n", err)
+		return 0
+	}
 
 	session, err := client.Session.New(ctx, opencode.SessionNewParams{
 		Directory: opencode.F(repoRoot),
@@ -674,18 +725,31 @@ func runFix(client *opencode.Client, ctx context.Context, repoRoot string, selec
 	}
 	<-idleCh
 
-	// Commit any changes opencode made
-	diff, _ := gitRun(repoRoot, "diff", "--stat")
-	if diff == "" {
-		fmt.Println("  (no file changes detected after fix)")
-		return len(findings)
+	// Commit only tracked, fix-related changes from this fixer session.
+	afterStatus, err := gitStatusSnapshot(repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix status snapshot error: %v\n", err)
+		return 0
 	}
-	if _, err := gitRun(repoRoot, "add", "-A"); err != nil {
+	stagePaths := fixerStagePaths(beforeStatus, afterStatus)
+	if len(stagePaths) == 0 {
+		fmt.Println("  (no file changes detected after fix)")
+		return 0
+	}
+	addArgs := append([]string{"add", "-u", "--"}, stagePaths...)
+	if _, err := gitRun(repoRoot, addArgs...); err != nil {
 		fmt.Fprintf(os.Stderr, "  git add failed: %v\n", err)
 		return 0
 	}
+	stagedArgs := append([]string{"diff", "--cached", "--name-only", "--"}, stagePaths...)
+	staged, _ := gitRun(repoRoot, stagedArgs...)
+	if staged == "" {
+		fmt.Println("  (no file changes detected after fix)")
+		return 0
+	}
 	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)
-	if _, err := gitRun(repoRoot, "commit", "-m", msg); err != nil {
+	commitArgs := append([]string{"commit", "-m", msg, "--"}, stagePaths...)
+	if _, err := gitRun(repoRoot, commitArgs...); err != nil {
 		fmt.Fprintf(os.Stderr, "  git commit failed: %v\n", err)
 		return 0
 	}

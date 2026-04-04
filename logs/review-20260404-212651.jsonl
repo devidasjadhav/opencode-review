@@ -1,0 +1,3 @@
+{"commit":"345d8ab06115c9490e36edcaabc29398de4a9d8c","iteration":1,"subject":"feat: auto-fix loop — apply AI fixes between review iterations","ts":"2026-04-04T21:28:12+05:30","verdict":"REQUEST CHANGES"}
+{"action":"issue_created","file":"cli/main.go:678-681,cli/main.go","issue":49,"lineRange":"1008-1010","severity":"Critical","title":"No-op fix still triggers immediate re-review loop","ts":"2026-04-04T21:28:14+05:30"}
+{"action":"issue_created","file":"cli/main.go:683-684,cli/main.go","issue":50,"lineRange":"797-812","severity":"High","title":"`git add -A` commits unrelated workspace files (including review logs)","ts":"2026-04-04T21:28:16+05:30"}
