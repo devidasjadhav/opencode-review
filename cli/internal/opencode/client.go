@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -204,19 +205,33 @@ func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected t
 		fmt.Println("  (no file changes detected after fix)")
 		return 0
 	}
-	addArgs := append([]string{"add", "-u", "--"}, stagePaths...)
+	// Validate paths exist before staging to catch any path corruption bugs.
+	var validPaths []string
+	for _, p := range stagePaths {
+		abs := filepath.Join(repoRoot, p)
+		if _, err := os.Stat(abs); err == nil {
+			validPaths = append(validPaths, p)
+		} else {
+			fmt.Fprintf(os.Stderr, "  Warning: skipping invalid stage path %q: %v\n", p, err)
+		}
+	}
+	if len(validPaths) == 0 {
+		fmt.Println("  (no valid paths to stage after fix)")
+		return 0
+	}
+	addArgs := append([]string{"add", "-u", "--"}, validPaths...)
 	if _, err := git.Run(repoRoot, addArgs...); err != nil {
 		fmt.Fprintf(os.Stderr, "  git add failed: %v\n", err)
 		return 0
 	}
-	stagedArgs := append([]string{"diff", "--cached", "--name-only", "--"}, stagePaths...)
+	stagedArgs := append([]string{"diff", "--cached", "--name-only", "--"}, validPaths...)
 	staged, _ := git.Run(repoRoot, stagedArgs...)
 	if staged == "" {
 		fmt.Println("  (no file changes detected after fix)")
 		return 0
 	}
 	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)
-	commitArgs := append([]string{"commit", "-m", msg, "--"}, stagePaths...)
+	commitArgs := append([]string{"commit", "-m", msg, "--"}, validPaths...)
 	if _, err := git.Run(repoRoot, commitArgs...); err != nil {
 		fmt.Fprintf(os.Stderr, "  git commit failed: %v\n", err)
 		return 0
