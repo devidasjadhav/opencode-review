@@ -34,6 +34,9 @@ func Run() {
 	mergeStrategy := flag.String("merge-strategy", "squash", "Merge strategy: merge, squash, rebase")
 	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
 	loopInterval := flag.Duration("loop-interval", 30*time.Second, "Wait between loop iterations")
+	baseBranch := flag.String("base", "master", "Base branch for auto-created PRs")
+	createBranch := flag.Bool("create-branch", false, "Create a new fix branch from current HEAD and push before opening PR")
+	validateIssues := flag.Bool("validate-issues", false, "Check open issues against current code and close stale ones before fixing")
 	flag.Parse()
 
 	dir := *dirFlag
@@ -56,6 +59,25 @@ func Run() {
 	client := occ.NewClient(*serverURL)
 	ctx := context.Background()
 
+	// Create and push a new fix branch if requested.
+	if *createBranch {
+		newBranch := fmt.Sprintf("fix/opencode-%s", time.Now().Format("20060102-150405"))
+		if _, err := git.Run(repoRoot, "checkout", "-b", newBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create branch %q: %v\n", newBranch, err)
+			os.Exit(1)
+		}
+		// Create an empty commit so GitHub allows PR creation against base.
+		if _, err := git.Run(repoRoot, "commit", "--allow-empty", "-m", "chore: open fix branch for opencode-review"); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create empty commit: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := git.Run(repoRoot, "push", "-u", "origin", newBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to push branch %q: %v\n", newBranch, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Created and pushed branch %q\n", newBranch)
+	}
+
 	// GitHub client — required for --pr, --issues, --loop, --merge
 	var ghClient *gogithub.Client
 	var ghOwner, ghRepo string
@@ -72,18 +94,44 @@ func Run() {
 			os.Exit(1)
 		}
 		if *postPR || *loopMode || *mergeOnApprove {
-			ghPRNum, err = gh.OpenPRNumber(ctx, ghClient, ghOwner, ghRepo, repoRoot)
+			var created bool
+			ghPRNum, created, err = gh.EnsureOpenPR(ctx, ghClient, ghOwner, ghRepo, repoRoot, *baseBranch)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "GitHub PR: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+			if created {
+				fmt.Printf("GitHub: created %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+			} else {
+				fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+			}
 		} else if *createIssues {
-			if n, err2 := gh.OpenPRNumber(ctx, ghClient, ghOwner, ghRepo, repoRoot); err2 == nil {
+			if n, _, err2 := gh.EnsureOpenPR(ctx, ghClient, ghOwner, ghRepo, repoRoot, *baseBranch); err2 == nil {
 				ghPRNum = n
 				fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
 			}
 		}
+	}
+
+	// Validate open issues against current codebase before proceeding.
+	if *validateIssues && ghClient != nil {
+		fmt.Println("Validating open issues against current codebase...")
+		validations, verr := gh.ValidateIssues(ctx, ghClient, ghOwner, ghRepo, repoRoot)
+		if verr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: issue validation failed: %v\n", verr)
+		} else {
+			for _, v := range validations {
+				if v.Valid {
+					fmt.Printf("  #%d ✓ %s\n    %s\n", v.Number, v.Title, v.Reason)
+				} else {
+					fmt.Printf("  #%d ✗ STALE — %s\n    Closing: %s\n", v.Number, v.Title, v.Reason)
+					comment := fmt.Sprintf("Closing as stale: %s", v.Reason)
+					_ = gh.CommentOnIssue(ctx, ghClient, ghOwner, ghRepo, v.Number, comment)
+					_ = gh.CloseIssue(ctx, ghClient, ghOwner, ghRepo, v.Number)
+				}
+			}
+		}
+		fmt.Println()
 	}
 
 	models, err := occ.ListModels(client, ctx, repoRoot)
