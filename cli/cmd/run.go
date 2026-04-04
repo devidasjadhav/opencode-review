@@ -104,10 +104,7 @@ func Run() {
 	}
 	fmt.Printf("\nUsing: %s / %s\n\n", selected.ProviderName, selected.ModelName)
 
-	if *mergeOnApprove {
-		*loopMode = true
-		*loopInterval = 0
-	}
+	normalizeLoopFlags(loopMode, mergeOnApprove, autoFix, loopInterval)
 
 	log := logger.New(repoRoot)
 	defer log.Close()
@@ -208,6 +205,15 @@ func Run() {
 		if *loopInterval > 0 {
 			fmt.Printf("\nWaiting %s for fixes before next review...\n", *loopInterval)
 			time.Sleep(*loopInterval)
+		}
+	}
+}
+
+func normalizeLoopFlags(loopMode, mergeOnApprove, autoFix *bool, loopInterval *time.Duration) {
+	if *mergeOnApprove {
+		*loopMode = true
+		if !*autoFix {
+			*loopInterval = 0
 		}
 	}
 }
