@@ -4,3 +4,6 @@
 {"action":"auto_fix","findings_fixed":2,"ts":"2026-04-04T21:30:16+05:30"}
 {"commit":"72e180925ffc2be96c6120b2ab5944f82fef770e","iteration":2,"subject":"fix: auto-fix 2 finding(s) from review iteration 1","ts":"2026-04-04T21:32:40+05:30","verdict":"REQUEST CHANGES"}
 {"action":"issue_created","file":"cli/main.go","issue":51,"lineRange":"114-126","severity":"High","title":"Status-only diffing misses fixer edits on already-dirty tracked files","ts":"2026-04-04T21:32:42+05:30"}
+{"action":"auto_fix","findings_fixed":1,"ts":"2026-04-04T21:33:30+05:30"}
+{"commit":"8cb7b442d77bae2d31ec30b4834d1025bded8fab","iteration":3,"subject":"fix: auto-fix 1 finding(s) from review iteration 2","ts":"2026-04-04T21:35:20+05:30","verdict":"REQUEST CHANGES"}
+{"action":"issue_created","file":"cli/main.go","issue":52,"lineRange":"98-125","severity":"High","title":"Hashing directory paths aborts auto-fix","ts":"2026-04-04T21:35:22+05:30"}

@@ -95,9 +95,14 @@ func worktreeContentFingerprint(root, path, status string) (string, error) {
 	if strings.Contains(status, "D") {
 		return "<deleted>", nil
 	}
+	abs := filepath.Join(root, path)
+	if fi, statErr := os.Lstat(abs); statErr == nil && fi.IsDir() {
+		return "<directory>", nil
+	}
 	hash, err := gitRun(root, "hash-object", "--", path)
 	if err != nil {
-		return "", err
+		// Non-blob entries (for example submodules) cannot be hashed with hash-object.
+		return "<non-blob>", nil
 	}
 	return hash, nil
 }
