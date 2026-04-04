@@ -12,13 +12,18 @@ import (
 )
 
 func Run(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	return RunInDir(dir, "git", args...)
+}
+
+// RunInDir runs an arbitrary command in dir and returns trimmed stdout+stderr output.
+func RunInDir(dir, name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out.String())
+		return out.String(), fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, out.String())
 	}
 	return strings.TrimSpace(out.String()), nil
 }

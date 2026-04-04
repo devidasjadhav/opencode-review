@@ -168,30 +168,45 @@ func RunReview(client *sdk.Client, ctx context.Context, repoRoot string, selecte
 
 // RunFix sends fix prompts for all findings, commits and pushes any changes.
 // Returns the number of findings sent for fixing.
-func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int) int {
+type FixPersister interface {
+	Persist(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error)
+}
+
+type gitFixPersister struct{}
+
+func NewGitFixPersister() FixPersister {
+	return gitFixPersister{}
+}
+
+func (gitFixPersister) Persist(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error) {
+	return stageCommitPushFixes(repoRoot, findings, iteration, stagePaths)
+}
+
+func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int, persister FixPersister) (int, error) {
 	if len(findings) == 0 {
-		return 0
+		return 0, nil
+	}
+	if persister == nil {
+		persister = NewGitFixPersister()
 	}
 	prompt := buildFixPrompt(findings)
 	applyResult, err := applyFixPrompt(client, ctx, repoRoot, selected, prompt)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		return 0
+		return 0, err
 	}
 	if applyResult.Outcome != fixApplyChanged {
 		fmt.Println("  (no file changes detected after fix)")
-		return 0
+		return 0, nil
 	}
-	persistResult, err := stageCommitPushFixes(repoRoot, findings, iteration, applyResult.StagePaths)
+	persistResult, err := persister.Persist(repoRoot, findings, iteration, applyResult.StagePaths)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		return 0
+		return 0, err
 	}
 	if persistResult.Outcome != fixPersistCommitted {
-		return 0
+		return 0, nil
 	}
 	fmt.Printf("  Committed and pushed fixes: %q\n", persistResult.CommitMessage)
-	return len(findings)
+	return len(findings), nil
 }
 
 type fixApplyOutcome int
@@ -231,6 +246,7 @@ func buildFixPrompt(findings []types.Finding) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "You are an automated code fixer. Apply ALL of the following fixes to the codebase.\n")
 	fmt.Fprintf(&sb, "Make minimal, targeted changes. Do not refactor unrelated code.\n")
+	fmt.Fprintf(&sb, "IMPORTANT: Only modify the specific file(s) referenced in each finding. Do NOT touch any other files.\n")
 	fmt.Fprintf(&sb, "After applying all fixes, stop — do not explain or summarise.\n\n")
 	for i, f := range findings {
 		if f.AgentPrompt == "" {
@@ -291,6 +307,13 @@ func stageCommitPushFixes(repoRoot string, findings []types.Finding, iteration i
 		fmt.Println("  (no file changes detected after fix)")
 		return fixPersistResult{Outcome: fixPersistNoop}, nil
 	}
+	// Build gate: verify the codebase compiles before committing.
+	if out, err := git.RunInDir(repoRoot, "go", "build", "./..."); err != nil {
+		// Restore changes so the working tree is clean for the next iteration.
+		git.Run(repoRoot, "checkout", "--", ".")  //nolint
+		return fixPersistResult{}, runFixError{Context: fmt.Sprintf("  build failed after fix — changes reverted:\n%s", out), Err: err}
+	}
+
 	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)
 	commitArgs := append([]string{"commit", "-m", msg, "--"}, validPaths...)
 	if _, err := git.Run(repoRoot, commitArgs...); err != nil {
