@@ -385,25 +385,10 @@ func extractVerdict(review string) string {
 // ── GitHub client ─────────────────────────────────────────────────────────────
 
 // ghClient builds a GitHub API client from GITHUB_TOKEN env var.
-// resolveGitHubToken returns GITHUB_TOKEN from env, falling back to gh CLI's stored token.
-func resolveGitHubToken() string {
-	if t := os.Getenv("GITHUB_TOKEN"); t != "" {
-		return t
-	}
-	// Fallback: ask the gh CLI for its token (works even in non-interactive shells)
-	out, err := exec.Command("gh", "auth", "token").Output()
-	if err == nil {
-		if t := strings.TrimSpace(string(out)); t != "" {
-			return t
-		}
-	}
-	return ""
-}
-
 func ghClient(ctx context.Context) (*github.Client, error) {
-	token := resolveGitHubToken()
+	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
-		return nil, fmt.Errorf("no GitHub token found: set GITHUB_TOKEN or run `gh auth login`")
+		return nil, fmt.Errorf("GITHUB_TOKEN environment variable not set")
 	}
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	return github.NewClient(oauth2.NewClient(ctx, ts)), nil
