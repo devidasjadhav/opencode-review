@@ -439,6 +439,10 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 		os.Exit(1)
 	}
 	sessionID := session.ID
+	// Clean up session when review is done to avoid orphan sessions in loop mode.
+	defer func() {
+		client.Session.Delete(ctx, sessionID, opencode.SessionDeleteParams{}) //nolint
+	}()
 
 	idleCh := make(chan string, 2)
 	streamCtx, cancel := context.WithCancel(ctx)
@@ -514,6 +518,7 @@ func main() {
 	postPR := flag.Bool("pr", false, "Post review as GitHub PR comment")
 	createIssues := flag.Bool("issues", false, "Create GitHub issues for each finding")
 	loopMode := flag.Bool("loop", false, "Keep reviewing latest HEAD until APPROVE, then merge and close issues")
+	mergeOnApprove := flag.Bool("merge", false, "Merge PR immediately if this review is APPROVE (one-shot, alias for single-pass --loop)")
 	mergeStrategy := flag.String("merge-strategy", "squash", "Merge strategy: merge, squash, rebase")
 	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
 	loopInterval := flag.Duration("loop-interval", 30*time.Second, "How long to wait between loop iterations")
@@ -558,15 +563,22 @@ func main() {
 	}
 	fmt.Printf("\nUsing: %s / %s\n\n", selected.ProviderName, selected.ModelName)
 
-	// Track open issues across loop iterations
+	// --merge is a one-shot alias: review once, merge if APPROVE
+	if *mergeOnApprove {
+		*loopMode = true
+		*loopInterval = 0
+	}
+
+	// Track open issues across loop iterations (deduplicated by finding key)
 	var openIssues []int
+	seenFindings := map[string]bool{} // key: "file:line:title"
 	iteration := 0
 
 	for {
 		iteration++
 		ref := *commitRef
 		if *loopMode && iteration > 1 {
-			ref = "HEAD" // always review latest after first pass
+			ref = "HEAD"
 		}
 
 		hash, subject, body, diff, err := getCommitInfo(repoRoot, ref)
@@ -591,45 +603,46 @@ func main() {
 			}
 		}
 
-		// Create GitHub issues for each finding
+		// Create GitHub issues for new findings only (deduplicated)
 		if *createIssues && reviewText != "" {
 			findings := parseFindings(reviewText)
-			if len(findings) > 0 {
-				fmt.Printf("\nCreating %d GitHub issue(s)...\n", len(findings))
-				var newIssues []int
-				for _, f := range findings {
-					num, err := createIssue(repoRoot, f)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "  Failed to create issue for %q: %v\n", f.Title, err)
-						continue
-					}
-					fmt.Printf("  #%d [%s] %s:%s — %s\n", num, f.Severity, f.File, f.LineRange, f.Title)
-					newIssues = append(newIssues, num)
-					openIssues = append(openIssues, num)
+			var newIssues []int
+			for _, f := range findings {
+				key := fmt.Sprintf("%s:%s:%s", f.File, f.LineRange, f.Title)
+				if seenFindings[key] {
+					continue // already filed
 				}
-				// Link new issues to PR
-				if *postPR && len(newIssues) > 0 {
-					if err := linkIssuesToPR(repoRoot, newIssues); err != nil {
-						fmt.Fprintf(os.Stderr, "  Failed to link issues to PR: %v\n", err)
-					} else {
-						fmt.Println("  Issues linked to PR.")
-					}
+				seenFindings[key] = true
+				num, err := createIssue(repoRoot, f)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "  Failed to create issue for %q: %v\n", f.Title, err)
+					continue
 				}
-			} else {
-				fmt.Println("\nNo findings to create issues for.")
+				fmt.Printf("  #%d [%s] %s:%s — %s\n", num, f.Severity, f.File, f.LineRange, f.Title)
+				newIssues = append(newIssues, num)
+				openIssues = append(openIssues, num)
+			}
+			if len(newIssues) == 0 && len(findings) > 0 {
+				fmt.Println("  No new findings (all already tracked).")
+			}
+			// Link new issues to PR
+			if *postPR && len(newIssues) > 0 {
+				if err := linkIssuesToPR(repoRoot, newIssues); err != nil {
+					fmt.Fprintf(os.Stderr, "  Failed to link issues to PR: %v\n", err)
+				} else {
+					fmt.Println("  Issues linked to PR.")
+				}
 			}
 		}
 
 		fmt.Printf("\nVerdict: %s\n", verdict)
 
-		// Exit loop conditions
 		if !*loopMode {
 			break
 		}
 
 		if verdict == "APPROVE" {
 			fmt.Println("\nAll issues resolved — merging PR...")
-			// Safety: must be reviewing HEAD of current branch
 			currentHead, _ := gitRun(repoRoot, "rev-parse", "HEAD")
 			if hash != currentHead {
 				fmt.Fprintln(os.Stderr, "Refusing to merge: reviewed commit is not current HEAD.")
@@ -641,20 +654,31 @@ func main() {
 			}
 			fmt.Println("Merged.")
 
-			// Close all tracked issues
+			// Close all tracked issues; exit non-zero if any fail
+			var closeFailed bool
 			if len(openIssues) > 0 {
 				fmt.Printf("Closing %d issue(s)...\n", len(openIssues))
 				for _, n := range openIssues {
 					if err := closeIssue(repoRoot, n); err != nil {
 						fmt.Fprintf(os.Stderr, "  Failed to close #%d: %v\n", n, err)
+						closeFailed = true
 					} else {
 						fmt.Printf("  Closed #%d\n", n)
 					}
 				}
 			}
+			if closeFailed {
+				fmt.Fprintln(os.Stderr, "Warning: some issues could not be closed.")
+				os.Exit(1)
+			}
 			break
 		}
 
+		if *mergeOnApprove {
+			// --merge is one-shot: don't loop on non-APPROVE
+			fmt.Fprintln(os.Stderr, "Not merging: verdict is not APPROVE.")
+			os.Exit(1)
+		}
 		fmt.Printf("\nWaiting %s for fixes before next review...\n", *loopInterval)
 		time.Sleep(*loopInterval)
 	}
