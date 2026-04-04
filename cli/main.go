@@ -83,6 +83,80 @@ func getCommitInfo(root, ref string) (hash, subject, body, diff string, err erro
 	return
 }
 
+type statusSnapshotEntry struct {
+	Status       string
+	WorktreeHash string
+}
+
+func worktreeContentFingerprint(root, path, status string) (string, error) {
+	if strings.HasPrefix(status, "??") || strings.HasPrefix(status, "!!") {
+		return "", nil
+	}
+	if strings.Contains(status, "D") {
+		return "<deleted>", nil
+	}
+	abs := filepath.Join(root, path)
+	if fi, statErr := os.Lstat(abs); statErr == nil && fi.IsDir() {
+		return "<directory>", nil
+	}
+	hash, err := gitRun(root, "hash-object", "--", path)
+	if err != nil {
+		// Non-blob entries (for example submodules) cannot be hashed with hash-object.
+		return "<non-blob>", nil
+	}
+	return hash, nil
+}
+
+func gitStatusSnapshot(root string) (map[string]statusSnapshotEntry, error) {
+	out, err := gitRun(root, "status", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	snapshot := map[string]statusSnapshotEntry{}
+	if out == "" {
+		return snapshot, nil
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		status := line[:2]
+		path := strings.TrimSpace(line[3:])
+		if i := strings.Index(path, " -> "); i >= 0 {
+			path = path[i+4:]
+		}
+		worktreeHash, err := worktreeContentFingerprint(root, path, status)
+		if err != nil {
+			return nil, err
+		}
+		snapshot[path] = statusSnapshotEntry{Status: status, WorktreeHash: worktreeHash}
+	}
+	return snapshot, nil
+}
+
+func isOperationalArtifact(path string) bool {
+	p := filepath.ToSlash(path)
+	return strings.HasPrefix(p, "logs/")
+}
+
+func fixerStagePaths(before, after map[string]statusSnapshotEntry) []string {
+	var paths []string
+	for path, afterStatus := range after {
+		if isOperationalArtifact(path) {
+			continue
+		}
+		if strings.HasPrefix(afterStatus.Status, "??") {
+			continue
+		}
+		beforeEntry, existed := before[path]
+		if !existed || beforeEntry.Status != afterStatus.Status || beforeEntry.WorktreeHash != afterStatus.WorktreeHash {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
 // ── Model helpers ─────────────────────────────────────────────────────────────
 
 func listModels(client *opencode.Client, ctx context.Context, dir string) ([]ModelInfo, error) {
@@ -534,7 +608,7 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 						buf.WriteString(envelope.Properties.Delta)
 					case "reasoning":
 						// Suppress reasoning/thinking tokens from output and parsing
-}
+					}
 				}
 			case opencode.EventListResponseTypeSessionIdle:
 				idle, ok := event.AsUnion().(opencode.EventListResponseEventSessionIdle)
@@ -574,6 +648,148 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 	return <-idleCh, nil
 }
 
+// runFix sends each finding's agent fix prompt to opencode and waits for completion.
+// Returns the number of findings that were sent for fixing.
+func runFix(client *opencode.Client, ctx context.Context, repoRoot string, selected ModelInfo,
+	findings []Finding, iteration int) int {
+
+	if len(findings) == 0 {
+		return 0
+	}
+
+	// Build a single combined fix prompt for all findings so opencode has full context.
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "You are an automated code fixer. Apply ALL of the following fixes to the codebase.\n")
+	fmt.Fprintf(&sb, "Make minimal, targeted changes. Do not refactor unrelated code.\n")
+	fmt.Fprintf(&sb, "After applying all fixes, stop — do not explain or summarise.\n\n")
+	for i, f := range findings {
+		if f.AgentPrompt == "" {
+			continue
+		}
+		fmt.Fprintf(&sb, "--- Fix %d/%d [%s] %s:%s — %s ---\n", i+1, len(findings), f.Severity, f.File, f.LineRange, f.Title)
+		sb.WriteString(f.AgentPrompt)
+		sb.WriteString("\n\n")
+		if f.Diff != "" {
+			sb.WriteString("Suggested diff:\n```diff\n")
+			sb.WriteString(f.Diff)
+			sb.WriteString("\n```\n\n")
+		}
+	}
+	prompt := sb.String()
+	beforeStatus, err := gitStatusSnapshot(repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix status snapshot error: %v\n", err)
+		return 0
+	}
+
+	session, err := client.Session.New(ctx, opencode.SessionNewParams{
+		Directory: opencode.F(repoRoot),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix session error: %v\n", err)
+		return 0
+	}
+	sessionID := session.ID
+	defer func() {
+		client.Session.Delete(ctx, sessionID, opencode.SessionDeleteParams{}) //nolint
+	}()
+
+	idleCh := make(chan struct{}, 2)
+	streamCtx, cancel := context.WithCancel(ctx)
+	stream := client.Event.ListStreaming(streamCtx, opencode.EventListParams{
+		Directory: opencode.F(repoRoot),
+	})
+
+	go func() {
+		defer cancel()
+		for stream.Next() {
+			event := stream.Current()
+			switch event.Type {
+			case "message.part.delta":
+				var envelope struct {
+					Properties struct {
+						Field string `json:"field"`
+						Delta string `json:"delta"`
+					} `json:"properties"`
+				}
+				if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &envelope); err == nil {
+					if envelope.Properties.Field == "text" {
+						fmt.Print(envelope.Properties.Delta)
+					}
+				}
+			case opencode.EventListResponseTypeSessionIdle:
+				idle, ok := event.AsUnion().(opencode.EventListResponseEventSessionIdle)
+				if ok && idle.Properties.SessionID == sessionID {
+					fmt.Println()
+					idleCh <- struct{}{}
+				}
+			case opencode.EventListResponseTypeSessionError:
+				fmt.Fprintf(os.Stderr, "\n[fix session error] %s\n", event.JSON.RawJSON())
+				idleCh <- struct{}{}
+			}
+		}
+		if err := stream.Err(); err != nil && streamCtx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "\nFix stream error: %v\n", err)
+			idleCh <- struct{}{}
+		}
+	}()
+
+	_, err = client.Session.Prompt(ctx, sessionID, opencode.SessionPromptParams{
+		Directory: opencode.F(repoRoot),
+		Parts: opencode.F([]opencode.SessionPromptParamsPartUnion{
+			opencode.TextPartInputParam{
+				Text: opencode.F(prompt),
+				Type: opencode.F(opencode.TextPartInputTypeText),
+			},
+		}),
+		Model: opencode.F(opencode.SessionPromptParamsModel{
+			ModelID:    opencode.F(selected.ModelID),
+			ProviderID: opencode.F(selected.ProviderID),
+		}),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix prompt error: %v\n", err)
+		return 0
+	}
+	<-idleCh
+
+	// Commit only tracked, fix-related changes from this fixer session.
+	afterStatus, err := gitStatusSnapshot(repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix status snapshot error: %v\n", err)
+		return 0
+	}
+	stagePaths := fixerStagePaths(beforeStatus, afterStatus)
+	if len(stagePaths) == 0 {
+		fmt.Println("  (no file changes detected after fix)")
+		return 0
+	}
+	addArgs := append([]string{"add", "-u", "--"}, stagePaths...)
+	if _, err := gitRun(repoRoot, addArgs...); err != nil {
+		fmt.Fprintf(os.Stderr, "  git add failed: %v\n", err)
+		return 0
+	}
+	stagedArgs := append([]string{"diff", "--cached", "--name-only", "--"}, stagePaths...)
+	staged, _ := gitRun(repoRoot, stagedArgs...)
+	if staged == "" {
+		fmt.Println("  (no file changes detected after fix)")
+		return 0
+	}
+	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)
+	commitArgs := append([]string{"commit", "-m", msg, "--"}, stagePaths...)
+	if _, err := gitRun(repoRoot, commitArgs...); err != nil {
+		fmt.Fprintf(os.Stderr, "  git commit failed: %v\n", err)
+		return 0
+	}
+	branch, _ := gitRun(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if _, err := gitRun(repoRoot, "push", "origin", branch); err != nil {
+		fmt.Fprintf(os.Stderr, "  git push failed: %v\n", err)
+		return 0
+	}
+	fmt.Printf("  Committed and pushed fixes: %q\n", msg)
+	return len(findings)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -584,6 +800,7 @@ func main() {
 	postPR := flag.Bool("pr", false, "Post review as GitHub PR comment")
 	createIssues := flag.Bool("issues", false, "Create GitHub issues for each finding")
 	loopMode := flag.Bool("loop", false, "Keep reviewing latest HEAD until APPROVE, then merge and close issues")
+	autoFix := flag.Bool("auto-fix", false, "Automatically apply AI fixes between loop iterations (requires --loop)")
 	mergeOnApprove := flag.Bool("merge", false, "Merge PR immediately if this review is APPROVE (one-shot, alias for single-pass --loop)")
 	mergeStrategy := flag.String("merge-strategy", "squash", "Merge strategy: merge, squash, rebase")
 	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
@@ -868,7 +1085,26 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Not merging: verdict is not APPROVE.")
 			os.Exit(1)
 		}
-		fmt.Printf("\nWaiting %s for fixes before next review...\n", *loopInterval)
-		time.Sleep(*loopInterval)
+		if *autoFix {
+			findings := parseFindings(reviewText)
+			var fixable []Finding
+			for _, f := range findings {
+				if f.AgentPrompt != "" {
+					fixable = append(fixable, f)
+				}
+			}
+			if len(fixable) > 0 {
+				fmt.Printf("\n--- Auto-fixing %d finding(s) ---\n", len(fixable))
+				n := runFix(client, ctx, repoRoot, selected, fixable, iteration)
+				writeLog(map[string]any{"ts": time.Now().Format(time.RFC3339), "action": "auto_fix", "findings_fixed": n})
+				if n > 0 {
+					continue // skip sleep, re-review immediately
+				}
+			}
+		}
+		if *loopInterval > 0 {
+			fmt.Printf("\nWaiting %s for fixes before next review...\n", *loopInterval)
+			time.Sleep(*loopInterval)
+		}
 	}
 }

@@ -1,0 +1,151 @@
+
+Using: OpenAI / GPT-5.3 Codex
+
+─── Iteration 1 — reviewing 7b4923fe66a4
+  fix: dedupe issues, restore --merge, session cleanup, exit on close failure
+
+--- Code Review ---
+
+**Evaluating potential bugs**
+
+I’m considering that the regression against existing issues might be more concrete than just a dedupe failure. I need to decide if there are one or two findings. There's a note about the `--merge` exit for non-APPROVE. The commit mentions restoring `--merge` as a one-shot alias. Since `*loopMode=true`, if it hits `if !*loopMode break` before checking for `exit 1`, it exits on `REQUEST CHANGES`. It also exits on `COMMENT`, so it's not a bug. However, there might be an issue in session cleanup based on how things are set up.**Analyzing session cleanup issues**
+
+I’m reflecting on the `defer cancel()` in the goroutine. It only executes when the stream's `Next` loop ends, but if `runReview` returns right after `<-idleCh`, the deferred `Session.Delete` can occur while the stream goroutine is still running. This creates a situation where the session might get invalidated while the stream goroutine is waiting for an idle event. I need to ensure that `cancel()` is called appropriately to avoid potential race conditions or unexpected behavior.**Evaluating bug severity**
+
+I'm considering the severity level for two bugs. I might pick “Medium” for both, or go with “High” for one if there are duplicates. The first bug could lead to silent issues in loop mode, which feels like a medium or high impact. The second bug results in duplicates with every rerun, which seems high since it directly affects users. Overall, duplicates happening across reruns really stands out as bad.**Evaluating session cleanup issues**
+
+I'm thinking about the use of `--merge` without `--loop`, causing the `openIssues` to stay empty and preventing issue closing if APPROVED. With `--issues` being false by default, I'm unsure about this. When `--issues` is set, `openIssues` would track issues created, so closing is okay. Yet, there's a potential issue with `Session.Delete(ctx, sessionID...)` not being checked. If cleanup fails due to network problems, it may leave orphan sessions. This needs a better handling to avoid silent failures.**Analyzing cleanup behavior**
+
+I’m reflecting on whether it’s really a bug if the cleanup is just best-effort. However, I wonder about the deferred delete potentially racing with the stream goroutine that’s writing to `idleCh`. This could lead to sending data on a full channel. Since `idleCh` has a buffer size of 2, when an idle event occurs, the goroutine sends `buf.String()`. If there's an error after the delete, it might send an empty string without a receiver available after the function returns.**Analyzing code behavior**
+
+I’ve noticed another bug: the `seenFindings` variable is used across loop iterations, even after a finding is resolved. So, if the model keeps reporting the same finding in a later iteration because the code isn't actually fixed, it won’t create a new issue. That's intended deduplication, which is fine. I might need to verify line numbers with the exact `nl`. I could also check if the `existingIssues` helper returns only open issues and ignores closed ones, and that’s okay too.**Considering code changes**
+
+I’m thinking that the diff block should ideally show both old and new lines to clearly highlight the issue and the fix. Specifically, since it looks like the problem is related to missing deduplication on GitHub's side, showing the line `ghSeen := existingIssues(...)` as added in the fixed version might suffice to convey the fix effectively. This could provide clarity for anyone reviewing the changes. Let's see how this unfolds!## Summary
+This commit adds one-shot merge-on-approve behavior, in-memory issue deduplication across review loops, and session cleanup to reduce leaked opencode sessions.
+
+## Walkthrough
+- `cli/main.go` — adds `--merge`, changes loop control to support one-shot merge-on-approve, deduplicates issue creation within the running process, exits non-zero if issue closing fails after merge, and deletes the opencode session when a review finishes.
+
+## Findings
+
+### `[🟡 Medium]` cli/main.go:735-747 — A failed issue create is permanently skipped on later iterations
+`seenFindings[key]` is set before `createIssue(...)` succeeds, so any transient GitHub/API failure marks the finding as "already tracked" even though no issue was created. In loop mode that prevents the same unresolved finding from ever being retried on the next iteration.
+
+```diff
+- if seenFindings[key] {
+- 	continue
+- }
+- seenFindings[key] = true
+- num, err := createIssue(repoRoot, f)
+- if err != nil {
+- 	fmt.Fprintf(os.Stderr, "  Failed to create issue for %q: %v\n", f.Title, err)
+- 	continue
+- }
++ if seenFindings[key] {
++ 	continue
++ }
++ num, err := createIssue(repoRoot, f)
++ if err != nil {
++ 	fmt.Fprintf(os.Stderr, "  Failed to create issue for %q: %v\n", f.Title, err)
++ 	continue
++ }
++ seenFindings[key] = true
+```
+
+**AI agent fix prompt:** Move the `seenFindings` insertion to after a successful `createIssue` call, so transient API failures do not poison the dedupe cache. Keep the existing logging and `openIssues` append behavior unchanged, but only mark a finding as seen once GitHub has actually returned an issue number.
+
+### `[🟠 High]` cli/main.go:730-747 — Reruns can recreate issues that were already open before this process started
+The previous path queried GitHub via `existingIssues()` before creating new issues; this commit removes that lookup and relies only on `seenFindings`, which is reset on every invocation. That means a fresh run with `--issues` will recreate duplicates for findings that already have matching open issues from an earlier review session.
+
+```diff
+- ghSeen := existingIssues(ctx, gh, ghOwner, ghRepo)
+- var newIssues []int
+- for _, f := range findings {
+- 	ghTitle := fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
+- 	alreadyFiled := false
+- 	if ghSeen != nil {
+- 		fileKey := fmt.Sprintf("[%s] %s", f.Severity, f.File)
+- 		for t := range ghSeen {
+- 			if strings.Contains(t, fileKey) {
+- 				alreadyFiled = true
+- 				break
+- 			}
+- 		}
+- 	}
+- 	if alreadyFiled {
+- 		continue
+- 	}
++ ghSeen := existingIssues(ctx, gh, ghOwner, ghRepo)
++ var newIssues []int
++ for _, f := range findings {
++ 	ghTitle := fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
++ 	if ghSeen[ghTitle] || seenFindings[fmt.Sprintf("%s:%s:%s", f.File, f.LineRange, f.Title)] {
++ 		continue
++ 	}
+```
+
+**AI agent fix prompt:** Restore a GitHub-side dedupe check before issue creation. Use the exact issue title format already produced by `createIssue()` as the lookup key, and combine that with the in-process `seenFindings` cache so reruns do not reopen duplicates while loop iterations still avoid repeated filings.
+
+## Verdict
+REQUEST CHANGES
+The in-memory dedupe now loses retry safety on API failures and regresses duplicate suppression across separate runs.**Reviewing project structure**
+
+I need to review the entire project context and the LSP information. It’s important to inspect referenced files, imports, and types — just looking at the diff isn't enough. I’ll use the necessary tools but probably won’t edit any code. I’ll only provide findings if there are significant issues. I should look around the cli/main.go file and its related functions, like parseFindings and createIssue, and use grep or glob to help locate relevant symbols.I’m tracing the CLI flow and the helper functions it depends on so I can verify the commit against the rest of the project, not just the diff.**Troubleshooting issues in code**
+
+I need to determine if any issues exist in the code. I'll inspect how parseFindings might interact with createIssue or closeIssue. The recent commit changed "dedupe" to "seenFindings" and merged some aliases. To understand the full context, I'll check previous behavior and relevant tests. I'm also curious about the merge flag and loop mode documentation. It seems necessary to ensure that the configurations for mergeOnApprove, loopInterval, and loopMode are correctly set, especially if reviewText is empty or errors arise. I'll look at the project context and CLI docs for more clarity.I’ve confirmed the new code path in `cli/main.go`; now I’m checking surrounding behavior and existing conventions to see whether the new alias, deduping, or cleanup changes break any current invariants.**Inspecting code issues**
+
+I need to check the README docs regarding the loop and merge alias and see if there are any commits not reflected. My review should primarily focus on the code itself. I want to trace types around session deletion and event streaming, noting that the session delete call returns a boolean but is being ignored.  
+
+There could be a potential bug related to the context being canceled, and in loop mode, there’s something about deduplication with findings being reviewed across restarts. I need to think about how open issues are managed too.**Investigating potential bugs**
+
+I need to check if the `parseFindings` function could produce the same finding with the same key when line ranges differ. The commit mentions deduplication by file:line:title across loop iterations using a `seenFindings` map, which seems solid.
+
+Hmm, there might be a bug related to restoring the `--merge` alias. If `loopMode` is true and `mergeOnApprove` is also true, the GitHub client executes `openPRNumber` under certain conditions. If a user specifies `--merge` without `--pr` or `--issues`, a GitHub PR is still required,## Summary
+This commit adds one-shot `--merge` behavior, session cleanup, finding deduplication, and stricter which feels expected. I'll need to dig deeper into the `mergeOnApprove` logic to clarify behavior after non-APPROVE reviews. post-merge failure handling to make looped review/merge automation safer and less noisy.
+
+## Walkthrough
+-**Analyzing merge behavior**
+
+I'm `cli/main.go considering that,` — on adds a non deferred- `APPSessionRO.DeleteVE, it` in might be ` better torun reviewReview once` to reduce without merging and orphan just exit with a non-zeroed sessions after status each. A one review run.
+- `cli/main.go` — introduces `-shot alias-- formerge single-pass` ` as a-- one-shotloop alias that` enables loop mode likely for a indicates reviewing once, and if it's not approved, we exit non-zero single. I should check the previous semantics, but diving into the commit history might not review be and exits non-zero when verdict is not `APPROVE`.
+- `cli/main.go` — adds in-memory ded feasibleuplication of findings across loop iterations via `seenFindings.` keyed by `file 
+
+Additionally:line:title`, before creating there Git seemsHub to issues be a.
+ potential bug- `: withincli/main `runReview`, the `defer session.Delete` is executed even when the stream is still.go` — changes merge-complete issue cleanup to track close running failures and exit non-zero if. I any need ` to addressgh issue that. close` operation fails.
+
+## Findings
+### `[🟠 High]` cli/main.go:611-616 — Failed issue creation is permanently suppressed
+`seenFindings[key]` is set to `true` before `createIssue(repoRoot, f)` succeeds, so any transient GitHub/CLI failure marks the finding as already filed forever in this process; later loop iterations skip it, meaning the issue is never created, never linked to the PR, and never added to `openIssues` for close-on-merge.
+
+```diff
+-				seenFind**Analyzing code logic**
+
+Iings[key’m thinking] = there might true be a
+ problem where-			 seenFind	numings ded, err :=up createIssuelication happens(repo beforeRoot create,Issue. f)
+ If+ create			Issue	num, err := createIssue(repoRoot, f)
+ 				if fails err temporarily, != nil it still {
+ marks 				 the	fmt.Fprintf finding as(os seen, meaning.Stderr it, won " ’t Failed retry in to later create iterations, issue for %q: which %v could\n", f.Title, result err)
+ in missed 				 issues	continue. The
+ code suggests 			 that	 if the}
+ finding has+ been			 seen,	 it skipsseenFind itings. But[key if create]Issue fails = due true to a
+ rate limit or 			 similar	fmt issue.Printf,("  #%d [% it'ss] marked % seens and:% won'ts be retr — %ieds in subsequent\n loops,", num leading to, potential issues f not being.Sever createdity., f.File, f.LineRange, f.Title)
+```
+
+**AI agent fix prompt:** In `cli/main.go`, update the findings-to-issues loop so dedupe state is only recorded after a successful issue creation. Keep the existing `if seenFindings[key] { continue }` guard, but move `seenFindings[key] = true` to immediately after `createIssue` returns without error and before appending to `newIssues/openIssues`. Ensure failed creates remain retryable in later loop iterations**Evaluating merge closure issues**
+
+I’m and thinking keep about a all potential existing issue where logging if any behavior unchanged close.
+
+ operation fails## Verdict after a
+ mergeREQUEST CH,ANGES the
+ exitA transient issue- statuscreation could failure be non-zero currently causes permanent. false This ded meansup openlication issues might for remain that, finding which could within trigger the a run partially. closed state after the merge. I wonder if that's acceptable
+
+Posting PR review (REQUEST CHANGES)...
+, or if it represents a problem. This could also relate to the `--merge` alias and how it's intended for one-shot reviews before merging if approved.Posted.
+**Evaluating deduplication issue**
+
+I realize that since seenFindings starts out empty, the commit will recreate the same issue because deduplication only occurs across loop iterations  Skipping (already open): [Medium] cli/main.go:735-747 — A failed issue create is permanently skipped on later iterations
+  Skipping (already open): [High] cli/main.go:730-747 — Reruns can recreate issues that were already open before this process started
+  Skipping (already open): [High] cli/main.go:611-616 — Failed issue creation is permanently suppressed
+  No new findings (all already tracked).
+
+Verdict: REQUEST CHANGES
