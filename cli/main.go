@@ -45,21 +45,21 @@ func resolveRepoRoot(dir string) (string, error) {
 	return root, nil
 }
 
-func getLatestCommitInfo(root string) (hash, subject, body, diff string, err error) {
-	hash, err = gitRun(root, "rev-parse", "HEAD")
+func getCommitInfo(root, ref string) (hash, subject, body, diff string, err error) {
+	hash, err = gitRun(root, "rev-parse", ref)
+	if err != nil {
+		err = fmt.Errorf("unknown ref %q: %w", ref, err)
+		return
+	}
+	subject, err = gitRun(root, "log", "-1", "--format=%s", hash)
 	if err != nil {
 		return
 	}
-	subject, err = gitRun(root, "log", "-1", "--format=%s")
+	body, err = gitRun(root, "log", "-1", "--format=%b", hash)
 	if err != nil {
 		return
 	}
-	body, err = gitRun(root, "log", "-1", "--format=%b")
-	if err != nil {
-		return
-	}
-	// Full diff with context
-	diff, err = gitRun(root, "show", "--stat", "--patch", "HEAD")
+	diff, err = gitRun(root, "show", "--stat", "--patch", hash)
 	return
 }
 
@@ -114,18 +114,16 @@ func selectModel(models []ModelInfo) ModelInfo {
 
 func buildReviewPrompt(hash, subject, body, diff string) string {
 	var sb strings.Builder
-	sb.WriteString("Please do a thorough code review of the following git commit.\n\n")
-	sb.WriteString("Use the full project context (all files, imports, types) and LSP information ")
-	sb.WriteString("(type definitions, references, diagnostics) to give a precise review. ")
-	sb.WriteString("Do not limit the review to the diff alone — consider how the changes interact ")
-	sb.WriteString("with the rest of the codebase.\n\n")
-	sb.WriteString("Focus on:\n")
-	sb.WriteString("- Correctness and logic errors\n")
-	sb.WriteString("- Type safety and interface contracts\n")
-	sb.WriteString("- Security issues\n")
-	sb.WriteString("- Performance concerns\n")
-	sb.WriteString("- Missing error handling\n")
-	sb.WriteString("- Code style and consistency with the rest of the codebase\n\n")
+	sb.WriteString("Review the following git commit using the full project context and LSP info.\n\n")
+	sb.WriteString("Output format — respond ONLY with this structure, no prose:\n\n")
+	sb.WriteString("## Summary\n")
+	sb.WriteString("One sentence describing what this commit does.\n\n")
+	sb.WriteString("## Findings\n")
+	sb.WriteString("List only real issues. For each:\n")
+	sb.WriteString("`[HIGH|MEDIUM|LOW]` **file:line** — issue description. **Fix:** one-line actionable suggestion.\n\n")
+	sb.WriteString("If there are no issues, write: _No issues found._\n\n")
+	sb.WriteString("## Verdict\n")
+	sb.WriteString("One of: `APPROVE` / `REQUEST CHANGES` / `COMMENT` — with one sentence reason.\n\n")
 	sb.WriteString("---\n")
 	fmt.Fprintf(&sb, "Commit: %s\n", hash)
 	fmt.Fprintf(&sb, "Subject: %s\n", subject)
@@ -137,7 +135,8 @@ func buildReviewPrompt(hash, subject, body, diff string) string {
 	return sb.String()
 }
 
-func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir string, idleCh chan struct{}) {
+// streamResponse streams the response to stdout and returns the full text via doneCh.
+func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir string, idleCh chan string) {
 	streamCtx, cancel := context.WithCancel(ctx)
 
 	stream := client.Event.ListStreaming(streamCtx, opencode.EventListParams{
@@ -146,6 +145,7 @@ func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir
 
 	go func() {
 		defer cancel()
+		var buf strings.Builder
 		for stream.Next() {
 			event := stream.Current()
 			switch event.Type {
@@ -159,6 +159,7 @@ func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir
 				if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &envelope); err == nil {
 					if envelope.Properties.Field == "text" && envelope.Properties.Delta != "" {
 						fmt.Print(envelope.Properties.Delta)
+						buf.WriteString(envelope.Properties.Delta)
 					}
 				}
 			case opencode.EventListResponseTypeSessionIdle:
@@ -166,11 +167,11 @@ func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir
 				if ok && idle.Properties.SessionID == sessionID {
 					fmt.Println()
 					fmt.Println()
-					idleCh <- struct{}{}
+					idleCh <- buf.String()
 				}
 			case opencode.EventListResponseTypeSessionError:
 				fmt.Fprintf(os.Stderr, "\n[session error] %s\n", event.JSON.RawJSON())
-				idleCh <- struct{}{}
+				idleCh <- ""
 			}
 		}
 		if err := stream.Err(); err != nil && streamCtx.Err() == nil {
@@ -179,10 +180,46 @@ func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir
 	}()
 }
 
+func postGitHubPRReview(repoRoot, body, verdict string) error {
+	// Detect PR number for current branch via gh CLI
+	prJSON, err := gitRun(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return fmt.Errorf("cannot get branch: %w", err)
+	}
+	_ = prJSON // branch name, used implicitly by gh
+
+	// Determine gh review event from verdict
+	event := "COMMENT"
+	switch {
+	case strings.Contains(verdict, "APPROVE"):
+		event = "APPROVE"
+	case strings.Contains(verdict, "REQUEST CHANGES"):
+		event = "REQUEST_CHANGES"
+	}
+
+	cmd := exec.Command("gh", "pr", "review", "--body", body, "--"+strings.ToLower(strings.ReplaceAll(event, "_", "-")))
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func extractVerdict(review string) string {
+	for _, line := range strings.Split(review, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "APPROVE") || strings.Contains(line, "REQUEST CHANGES") || strings.Contains(line, "COMMENT") {
+			return line
+		}
+	}
+	return "COMMENT"
+}
+
 func main() {
 	serverURL := flag.String("url", "http://localhost:4096", "Opencode server URL")
 	dirFlag := flag.String("dir", "", "Git repo directory to review (default: current directory)")
 	modelNum := flag.Int("model", 0, "Model number from the list (skips interactive selection)")
+	postPR := flag.Bool("pr", false, "Post review as a GitHub PR comment (requires gh CLI)")
+	commitRef := flag.String("commit", "HEAD", "Git ref to review (commit hash, branch, tag)")
 	flag.Parse()
 
 	// Resolve directory
@@ -204,8 +241,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Get latest commit
-	hash, subject, body, diff, err := getLatestCommitInfo(repoRoot)
+	// Get commit info
+	hash, subject, body, diff, err := getCommitInfo(repoRoot, *commitRef)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading commit: %v\n", err)
 		os.Exit(1)
@@ -246,7 +283,7 @@ func main() {
 	sessionID := session.ID
 
 	// Start event stream
-	idleCh := make(chan struct{}, 2)
+	idleCh := make(chan string, 2)
 	streamResponse(client, ctx, sessionID, repoRoot, idleCh)
 
 	// Send review prompt
@@ -272,5 +309,16 @@ func main() {
 	}
 
 	// Wait for response to complete
-	<-idleCh
+	reviewText := <-idleCh
+
+	// Optionally post to GitHub PR
+	if *postPR && reviewText != "" {
+		verdict := extractVerdict(reviewText)
+		fmt.Printf("Posting to GitHub PR (%s)...\n", verdict)
+		if err := postGitHubPRReview(repoRoot, reviewText, verdict); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to post PR review: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Posted.")
+	}
 }

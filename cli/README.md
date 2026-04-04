@@ -25,8 +25,12 @@ go build -o opencode-review .
 # Specify a repo and skip model selection
 ./opencode-review --dir /path/to/repo --model 419
 
-# Custom opencode server URL
-./opencode-review --url http://localhost:4096 --dir /path/to/repo --model 419
+# Review a specific commit, branch, or tag
+./opencode-review --dir /path/to/repo --model 419 --commit abc1234
+./opencode-review --dir /path/to/repo --model 419 --commit feat/my-branch
+
+# Post the review directly to the open GitHub PR
+./opencode-review --dir /path/to/repo --model 419 --pr
 ```
 
 ## Flags
@@ -36,6 +40,8 @@ go build -o opencode-review .
 | `--url` | `http://localhost:4096` | Opencode server URL |
 | `--dir` | current directory | Git repo to review |
 | `--model` | 0 (prompts) | Model number from the list (skips prompt) |
+| `--commit` | `HEAD` | Git ref to review (hash, branch, tag) |
+| `--pr` | false | Post review as GitHub PR review (requires `gh` CLI) |
 
 ## How it works
 
