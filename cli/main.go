@@ -114,16 +114,33 @@ func selectModel(models []ModelInfo) ModelInfo {
 
 func buildReviewPrompt(hash, subject, body, diff string) string {
 	var sb strings.Builder
-	sb.WriteString("Review the following git commit using the full project context and LSP info.\n\n")
-	sb.WriteString("Output format — respond ONLY with this structure, no prose:\n\n")
+	sb.WriteString("Review the following git commit using the FULL project context and LSP info.\n")
+	sb.WriteString("Read all referenced files, trace types, follow imports — do not limit analysis to the diff alone.\n\n")
+	sb.WriteString("Respond ONLY with this exact structure (no prose outside it):\n\n")
+
 	sb.WriteString("## Summary\n")
-	sb.WriteString("One sentence describing what this commit does.\n\n")
+	sb.WriteString("One sentence: what this commit does and why.\n\n")
+
+	sb.WriteString("## Walkthrough\n")
+	sb.WriteString("Per-file bullet list: `file` — what changed and the intent.\n\n")
+
 	sb.WriteString("## Findings\n")
-	sb.WriteString("List only real issues. For each:\n")
-	sb.WriteString("`[HIGH|MEDIUM|LOW]` **file:line** — issue description. **Fix:** one-line actionable suggestion.\n\n")
-	sb.WriteString("If there are no issues, write: _No issues found._\n\n")
+	sb.WriteString("Only real, verifiable issues. For each finding use this format:\n\n")
+	sb.WriteString("### `[🔴 Critical|🟠 High|🟡 Medium|🔵 Low]` file:line-range — Short title\n")
+	sb.WriteString("Clear description referencing the exact code and how it interacts with the rest of the codebase.\n\n")
+	sb.WriteString("```diff\n")
+	sb.WriteString("- old code\n")
+	sb.WriteString("+ fixed code\n")
+	sb.WriteString("```\n\n")
+	sb.WriteString("**AI agent fix prompt:** One-paragraph instruction a coding agent can execute directly to fix this issue.\n\n")
+	sb.WriteString("If there are no issues: write `_No issues found._` and skip this section's subsections.\n\n")
+
 	sb.WriteString("## Verdict\n")
-	sb.WriteString("One of: `APPROVE` / `REQUEST CHANGES` / `COMMENT` — with one sentence reason.\n\n")
+	sb.WriteString("Exactly one of these tokens on its own line, followed by one sentence reason:\n")
+	sb.WriteString("`APPROVE` — safe to merge.\n")
+	sb.WriteString("`REQUEST CHANGES` — must fix before merge.\n")
+	sb.WriteString("`COMMENT` — observations only, no blocking issues.\n\n")
+
 	sb.WriteString("---\n")
 	fmt.Fprintf(&sb, "Commit: %s\n", hash)
 	fmt.Fprintf(&sb, "Subject: %s\n", subject)
@@ -246,6 +263,9 @@ func main() {
 	modelNum := flag.Int("model", 0, "Model number from the list (skips interactive selection)")
 	postPR := flag.Bool("pr", false, "Post review as a GitHub PR comment (requires gh CLI)")
 	commitRef := flag.String("commit", "HEAD", "Git ref to review (commit hash, branch, tag)")
+	doMerge := flag.Bool("merge", false, "Merge the PR after posting review (only if verdict is APPROVE)")
+	mergeStrategy := flag.String("merge-strategy", "squash", "Merge strategy: merge, squash, rebase")
+	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
 	flag.Parse()
 
 	// Resolve directory
@@ -337,9 +357,10 @@ func main() {
 	// Wait for response to complete
 	reviewText := <-idleCh
 
+	verdict := extractVerdict(reviewText)
+
 	// Optionally post to GitHub PR
 	if *postPR && reviewText != "" {
-		verdict := extractVerdict(reviewText)
 		fmt.Printf("Posting to GitHub PR (%s)...\n", verdict)
 		if err := postGitHubPRReview(repoRoot, reviewText, verdict); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to post PR review: %v\n", err)
@@ -347,4 +368,38 @@ func main() {
 		}
 		fmt.Println("Posted.")
 	}
+
+	// Optionally merge if verdict is APPROVE
+	if *doMerge {
+		if verdict != "APPROVE" {
+			fmt.Fprintf(os.Stderr, "Not merging: verdict is %q (only merges on APPROVE)\n", verdict)
+			os.Exit(1)
+		}
+		fmt.Printf("Merging PR (%s)...\n", *mergeStrategy)
+		if err := mergePR(repoRoot, *mergeStrategy, *deleteBranch); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to merge PR: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Merged.")
+	}
+}
+
+func mergePR(repoRoot, strategy string, deleteBranch bool) error {
+	args := []string{"pr", "merge"}
+	switch strategy {
+	case "merge":
+		args = append(args, "--merge")
+	case "rebase":
+		args = append(args, "--rebase")
+	default:
+		args = append(args, "--squash")
+	}
+	if deleteBranch {
+		args = append(args, "--delete-branch")
+	}
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
