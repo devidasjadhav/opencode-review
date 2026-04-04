@@ -574,6 +574,130 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 	return <-idleCh, nil
 }
 
+// runFix sends each finding's agent fix prompt to opencode and waits for completion.
+// Returns the number of findings that were sent for fixing.
+func runFix(client *opencode.Client, ctx context.Context, repoRoot string, selected ModelInfo,
+	findings []Finding, iteration int) int {
+
+	if len(findings) == 0 {
+		return 0
+	}
+
+	// Build a single combined fix prompt for all findings so opencode has full context.
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "You are an automated code fixer. Apply ALL of the following fixes to the codebase.\n")
+	fmt.Fprintf(&sb, "Make minimal, targeted changes. Do not refactor unrelated code.\n")
+	fmt.Fprintf(&sb, "After applying all fixes, stop — do not explain or summarise.\n\n")
+	for i, f := range findings {
+		if f.AgentPrompt == "" {
+			continue
+		}
+		fmt.Fprintf(&sb, "--- Fix %d/%d [%s] %s:%s — %s ---\n", i+1, len(findings), f.Severity, f.File, f.LineRange, f.Title)
+		sb.WriteString(f.AgentPrompt)
+		sb.WriteString("\n\n")
+		if f.Diff != "" {
+			sb.WriteString("Suggested diff:\n```diff\n")
+			sb.WriteString(f.Diff)
+			sb.WriteString("\n```\n\n")
+		}
+	}
+	prompt := sb.String()
+
+	session, err := client.Session.New(ctx, opencode.SessionNewParams{
+		Directory: opencode.F(repoRoot),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix session error: %v\n", err)
+		return 0
+	}
+	sessionID := session.ID
+	defer func() {
+		client.Session.Delete(ctx, sessionID, opencode.SessionDeleteParams{}) //nolint
+	}()
+
+	idleCh := make(chan struct{}, 2)
+	streamCtx, cancel := context.WithCancel(ctx)
+	stream := client.Event.ListStreaming(streamCtx, opencode.EventListParams{
+		Directory: opencode.F(repoRoot),
+	})
+
+	go func() {
+		defer cancel()
+		for stream.Next() {
+			event := stream.Current()
+			switch event.Type {
+			case "message.part.delta":
+				var envelope struct {
+					Properties struct {
+						Field string `json:"field"`
+						Delta string `json:"delta"`
+					} `json:"properties"`
+				}
+				if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &envelope); err == nil {
+					if envelope.Properties.Field == "text" {
+						fmt.Print(envelope.Properties.Delta)
+					}
+				}
+			case opencode.EventListResponseTypeSessionIdle:
+				idle, ok := event.AsUnion().(opencode.EventListResponseEventSessionIdle)
+				if ok && idle.Properties.SessionID == sessionID {
+					fmt.Println()
+					idleCh <- struct{}{}
+				}
+			case opencode.EventListResponseTypeSessionError:
+				fmt.Fprintf(os.Stderr, "\n[fix session error] %s\n", event.JSON.RawJSON())
+				idleCh <- struct{}{}
+			}
+		}
+		if err := stream.Err(); err != nil && streamCtx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "\nFix stream error: %v\n", err)
+			idleCh <- struct{}{}
+		}
+	}()
+
+	_, err = client.Session.Prompt(ctx, sessionID, opencode.SessionPromptParams{
+		Directory: opencode.F(repoRoot),
+		Parts: opencode.F([]opencode.SessionPromptParamsPartUnion{
+			opencode.TextPartInputParam{
+				Text: opencode.F(prompt),
+				Type: opencode.F(opencode.TextPartInputTypeText),
+			},
+		}),
+		Model: opencode.F(opencode.SessionPromptParamsModel{
+			ModelID:    opencode.F(selected.ModelID),
+			ProviderID: opencode.F(selected.ProviderID),
+		}),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix prompt error: %v\n", err)
+		return 0
+	}
+	<-idleCh
+
+	// Commit any changes opencode made
+	diff, _ := gitRun(repoRoot, "diff", "--stat")
+	if diff == "" {
+		fmt.Println("  (no file changes detected after fix)")
+		return len(findings)
+	}
+	if _, err := gitRun(repoRoot, "add", "-A"); err != nil {
+		fmt.Fprintf(os.Stderr, "  git add failed: %v\n", err)
+		return 0
+	}
+	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)
+	if _, err := gitRun(repoRoot, "commit", "-m", msg); err != nil {
+		fmt.Fprintf(os.Stderr, "  git commit failed: %v\n", err)
+		return 0
+	}
+	branch, _ := gitRun(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if _, err := gitRun(repoRoot, "push", "origin", branch); err != nil {
+		fmt.Fprintf(os.Stderr, "  git push failed: %v\n", err)
+		return 0
+	}
+	fmt.Printf("  Committed and pushed fixes: %q\n", msg)
+	return len(findings)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -584,6 +708,7 @@ func main() {
 	postPR := flag.Bool("pr", false, "Post review as GitHub PR comment")
 	createIssues := flag.Bool("issues", false, "Create GitHub issues for each finding")
 	loopMode := flag.Bool("loop", false, "Keep reviewing latest HEAD until APPROVE, then merge and close issues")
+	autoFix := flag.Bool("auto-fix", false, "Automatically apply AI fixes between loop iterations (requires --loop)")
 	mergeOnApprove := flag.Bool("merge", false, "Merge PR immediately if this review is APPROVE (one-shot, alias for single-pass --loop)")
 	mergeStrategy := flag.String("merge-strategy", "squash", "Merge strategy: merge, squash, rebase")
 	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
@@ -868,7 +993,26 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Not merging: verdict is not APPROVE.")
 			os.Exit(1)
 		}
-		fmt.Printf("\nWaiting %s for fixes before next review...\n", *loopInterval)
-		time.Sleep(*loopInterval)
+		if *autoFix {
+			findings := parseFindings(reviewText)
+			var fixable []Finding
+			for _, f := range findings {
+				if f.AgentPrompt != "" {
+					fixable = append(fixable, f)
+				}
+			}
+			if len(fixable) > 0 {
+				fmt.Printf("\n--- Auto-fixing %d finding(s) ---\n", len(fixable))
+				n := runFix(client, ctx, repoRoot, selected, fixable, iteration)
+				writeLog(map[string]any{"ts": time.Now().Format(time.RFC3339), "action": "auto_fix", "findings_fixed": n})
+				if n > 0 {
+					continue // skip sleep, re-review immediately
+				}
+			}
+		}
+		if *loopInterval > 0 {
+			fmt.Printf("\nWaiting %s for fixes before next review...\n", *loopInterval)
+			time.Sleep(*loopInterval)
+		}
 	}
 }
