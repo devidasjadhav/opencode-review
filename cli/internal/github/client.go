@@ -216,3 +216,30 @@ func OpenPRNumber(ctx context.Context, gh *gogithub.Client, owner, repo, repoRoo
 	}
 	return prs[0].GetNumber(), nil
 }
+
+// EnsureOpenPR returns the open PR number for the current branch, creating one if none exists.
+func EnsureOpenPR(ctx context.Context, gh *gogithub.Client, owner, repo, repoRoot, base string) (int, bool, error) {
+	num, err := OpenPRNumber(ctx, gh, owner, repo, repoRoot)
+	if err == nil {
+		return num, false, nil
+	}
+	branch, err2 := git.Run(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if err2 != nil {
+		return 0, false, err2
+	}
+	if branch == base {
+		return 0, false, fmt.Errorf("cannot create PR: already on base branch %q", base)
+	}
+	title := fmt.Sprintf("fix: changes on %s", branch)
+	body := ""
+	pr, _, err2 := gh.PullRequests.Create(ctx, owner, repo, &gogithub.NewPullRequest{
+		Title: &title,
+		Head:  &branch,
+		Base:  &base,
+		Body:  &body,
+	})
+	if err2 != nil {
+		return 0, false, fmt.Errorf("failed to create PR for branch %q: %w", branch, err2)
+	}
+	return pr.GetNumber(), true, nil
+}

@@ -34,6 +34,7 @@ func Run() {
 	mergeStrategy := flag.String("merge-strategy", "squash", "Merge strategy: merge, squash, rebase")
 	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
 	loopInterval := flag.Duration("loop-interval", 30*time.Second, "Wait between loop iterations")
+	baseBranch := flag.String("base", "master", "Base branch for auto-created PRs")
 	flag.Parse()
 
 	dir := *dirFlag
@@ -72,14 +73,19 @@ func Run() {
 			os.Exit(1)
 		}
 		if *postPR || *loopMode || *mergeOnApprove {
-			ghPRNum, err = gh.OpenPRNumber(ctx, ghClient, ghOwner, ghRepo, repoRoot)
+			var created bool
+			ghPRNum, created, err = gh.EnsureOpenPR(ctx, ghClient, ghOwner, ghRepo, repoRoot, *baseBranch)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "GitHub PR: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+			if created {
+				fmt.Printf("GitHub: created %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+			} else {
+				fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
+			}
 		} else if *createIssues {
-			if n, err2 := gh.OpenPRNumber(ctx, ghClient, ghOwner, ghRepo, repoRoot); err2 == nil {
+			if n, _, err2 := gh.EnsureOpenPR(ctx, ghClient, ghOwner, ghRepo, repoRoot, *baseBranch); err2 == nil {
 				ghPRNum = n
 				fmt.Printf("GitHub: %s/%s PR #%d\n", ghOwner, ghRepo, ghPRNum)
 			}
