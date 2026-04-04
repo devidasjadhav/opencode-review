@@ -83,12 +83,31 @@ func getCommitInfo(root, ref string) (hash, subject, body, diff string, err erro
 	return
 }
 
-func gitStatusSnapshot(root string) (map[string]string, error) {
+type statusSnapshotEntry struct {
+	Status       string
+	WorktreeHash string
+}
+
+func worktreeContentFingerprint(root, path, status string) (string, error) {
+	if strings.HasPrefix(status, "??") || strings.HasPrefix(status, "!!") {
+		return "", nil
+	}
+	if strings.Contains(status, "D") {
+		return "<deleted>", nil
+	}
+	hash, err := gitRun(root, "hash-object", "--", path)
+	if err != nil {
+		return "", err
+	}
+	return hash, nil
+}
+
+func gitStatusSnapshot(root string) (map[string]statusSnapshotEntry, error) {
 	out, err := gitRun(root, "status", "--porcelain")
 	if err != nil {
 		return nil, err
 	}
-	snapshot := map[string]string{}
+	snapshot := map[string]statusSnapshotEntry{}
 	if out == "" {
 		return snapshot, nil
 	}
@@ -101,7 +120,11 @@ func gitStatusSnapshot(root string) (map[string]string, error) {
 		if i := strings.Index(path, " -> "); i >= 0 {
 			path = path[i+4:]
 		}
-		snapshot[path] = status
+		worktreeHash, err := worktreeContentFingerprint(root, path, status)
+		if err != nil {
+			return nil, err
+		}
+		snapshot[path] = statusSnapshotEntry{Status: status, WorktreeHash: worktreeHash}
 	}
 	return snapshot, nil
 }
@@ -111,17 +134,17 @@ func isOperationalArtifact(path string) bool {
 	return strings.HasPrefix(p, "logs/")
 }
 
-func fixerStagePaths(before, after map[string]string) []string {
+func fixerStagePaths(before, after map[string]statusSnapshotEntry) []string {
 	var paths []string
 	for path, afterStatus := range after {
 		if isOperationalArtifact(path) {
 			continue
 		}
-		if strings.HasPrefix(afterStatus, "??") {
+		if strings.HasPrefix(afterStatus.Status, "??") {
 			continue
 		}
-		beforeStatus, existed := before[path]
-		if !existed || beforeStatus != afterStatus {
+		beforeEntry, existed := before[path]
+		if !existed || beforeEntry.Status != afterStatus.Status || beforeEntry.WorktreeHash != afterStatus.WorktreeHash {
 			paths = append(paths, path)
 		}
 	}
