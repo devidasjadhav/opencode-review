@@ -3,6 +3,7 @@ package github
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -163,18 +164,26 @@ func PostPRReview(ctx context.Context, gh *gogithub.Client, owner, repo string, 
 		Body:  &body,
 		Event: &event,
 	})
-	if err != nil && event != "COMMENT" {
-		if strings.Contains(err.Error(), "Can not approve your own") ||
-			strings.Contains(err.Error(), "own pull request") {
-			fmt.Fprintln(os.Stderr, "(falling back to COMMENT: cannot approve/request-changes own PR)")
-			comment := "COMMENT"
-			_, _, err = gh.PullRequests.CreateReview(ctx, owner, repo, prNum, &gogithub.PullRequestReviewRequest{
-				Body:  &body,
-				Event: &comment,
-			})
-		}
+	if err != nil && event != "COMMENT" && shouldFallbackToComment(err) {
+		fmt.Fprintln(os.Stderr, "(falling back to COMMENT review)")
+		comment := "COMMENT"
+		_, _, err = gh.PullRequests.CreateReview(ctx, owner, repo, prNum, &gogithub.PullRequestReviewRequest{
+			Body:  &body,
+			Event: &comment,
+		})
 	}
 	return err
+}
+
+func shouldFallbackToComment(err error) bool {
+	var ghErr *gogithub.ErrorResponse
+	if !errors.As(err, &ghErr) {
+		return false
+	}
+	if ghErr.Response == nil || ghErr.Response.StatusCode != 422 {
+		return false
+	}
+	return true
 }
 
 // MergePR merges the PR using the given strategy, optionally deleting the branch.
