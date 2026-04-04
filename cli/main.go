@@ -737,18 +737,8 @@ func main() {
 			var newIssues []int
 			for _, f := range findings {
 				ghTitle := fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
-				// Deduplicate: skip if an open issue already mentions this file+severity combination
-				alreadyFiled := false
-				if ghSeen != nil {
-					fileKey := fmt.Sprintf("[%s] %s", f.Severity, f.File)
-					for t := range ghSeen {
-						if strings.Contains(t, fileKey) {
-							alreadyFiled = true
-							break
-						}
-					}
-				}
-				if alreadyFiled {
+				// Deduplicate: skip if an open issue with this exact title already exists
+				if ghSeen[ghTitle] {
 					fmt.Printf("  Skipping (already open): %s\n", ghTitle)
 					continue
 				}
