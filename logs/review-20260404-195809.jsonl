@@ -1,1 +1,0 @@
-{"commit":"7b4923fe66a4f3b4abbcd1c7e2863cb54fe35420","iteration":1,"subject":"fix: dedupe issues, restore --merge, session cleanup, exit on close failure","ts":"2026-04-04T19:59:53+05:30","verdict":"REQUEST CHANGES"}

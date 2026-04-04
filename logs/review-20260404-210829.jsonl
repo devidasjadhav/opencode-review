@@ -1,2 +1,0 @@
-{"commit":"d99acf12ffc9a097e8f94f7307afe992c5979dfa","iteration":1,"subject":"fix: only close opencode-review issues on approve, error on list failure","ts":"2026-04-04T21:09:06+05:30","verdict":"APPROVE"}
-{"action":"pr_merged","strategy":"squash","ts":"2026-04-04T21:09:13+05:30"}
