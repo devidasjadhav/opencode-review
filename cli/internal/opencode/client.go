@@ -1,0 +1,231 @@
+package opencode
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+
+	sdk "github.com/sst/opencode-sdk-go"
+	"github.com/sst/opencode-sdk-go/option"
+
+	"github.com/talk/opencode-client/internal/git"
+	"github.com/talk/opencode-client/internal/types"
+)
+
+// NewClient creates a new opencode SDK client pointing at serverURL.
+func NewClient(serverURL string) *sdk.Client {
+	return sdk.NewClient(option.WithBaseURL(serverURL))
+}
+
+// ListModels returns all available models from the opencode server.
+func ListModels(client *sdk.Client, ctx context.Context, dir string) ([]types.ModelInfo, error) {
+	providers, err := client.App.Providers(ctx, sdk.AppProvidersParams{
+		Directory: sdk.F(dir),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var models []types.ModelInfo
+	for _, provider := range providers.Providers {
+		ids := make([]string, 0, len(provider.Models))
+		for id := range provider.Models {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			m := provider.Models[id]
+			models = append(models, types.ModelInfo{
+				ProviderID:   provider.ID,
+				ProviderName: provider.Name,
+				ModelID:      m.ID,
+				ModelName:    m.Name,
+			})
+		}
+	}
+	return models, nil
+}
+
+// SelectModel prompts the user interactively to choose a model.
+func SelectModel(models []types.ModelInfo) types.ModelInfo {
+	fmt.Println("Available models:")
+	for i, m := range models {
+		fmt.Printf("  [%2d] %-20s %s\n", i+1, m.ProviderName, m.ModelName)
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("\nSelect model number: ")
+		if !scanner.Scan() {
+			os.Exit(0)
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
+		if err != nil || n < 1 || n > len(models) {
+			fmt.Printf("  Enter a number between 1 and %d\n", len(models))
+			continue
+		}
+		return models[n-1]
+	}
+}
+
+// streamSession creates an opencode session, sends prompt, streams the response
+// and returns the full text when the session goes idle.
+// printText controls whether text deltas are printed to stdout.
+func streamSession(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string, printText bool) (string, error) {
+	session, err := client.Session.New(ctx, sdk.SessionNewParams{
+		Directory: sdk.F(repoRoot),
+	})
+	if err != nil {
+		return "", fmt.Errorf("error creating session: %w", err)
+	}
+	sessionID := session.ID
+	defer func() {
+		client.Session.Delete(ctx, sessionID, sdk.SessionDeleteParams{}) //nolint
+	}()
+
+	idleCh := make(chan string, 2)
+	streamCtx, cancel := context.WithCancel(ctx)
+	stream := client.Event.ListStreaming(streamCtx, sdk.EventListParams{
+		Directory: sdk.F(repoRoot),
+	})
+
+	go func() {
+		defer cancel()
+		var buf strings.Builder
+		for stream.Next() {
+			event := stream.Current()
+			switch event.Type {
+			case "message.part.delta":
+				var envelope struct {
+					Properties struct {
+						Field string `json:"field"`
+						Delta string `json:"delta"`
+					} `json:"properties"`
+				}
+				if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &envelope); err == nil {
+					if envelope.Properties.Field == "text" {
+						if printText {
+							fmt.Print(envelope.Properties.Delta)
+						}
+						buf.WriteString(envelope.Properties.Delta)
+					}
+					// "reasoning" field tokens are suppressed
+				}
+			case sdk.EventListResponseTypeSessionIdle:
+				idle, ok := event.AsUnion().(sdk.EventListResponseEventSessionIdle)
+				if ok && idle.Properties.SessionID == sessionID {
+					if printText {
+						fmt.Println()
+						fmt.Println()
+					}
+					idleCh <- buf.String()
+				}
+			case sdk.EventListResponseTypeSessionError:
+				fmt.Fprintf(os.Stderr, "\n[session error] %s\n", event.JSON.RawJSON())
+				idleCh <- ""
+			}
+		}
+		if err := stream.Err(); err != nil && streamCtx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "\nStream error: %v\n", err)
+			idleCh <- ""
+		}
+	}()
+
+	_, err = client.Session.Prompt(ctx, sessionID, sdk.SessionPromptParams{
+		Directory: sdk.F(repoRoot),
+		Parts: sdk.F([]sdk.SessionPromptParamsPartUnion{
+			sdk.TextPartInputParam{
+				Text: sdk.F(prompt),
+				Type: sdk.F(sdk.TextPartInputTypeText),
+			},
+		}),
+		Model: sdk.F(sdk.SessionPromptParamsModel{
+			ModelID:    sdk.F(selected.ModelID),
+			ProviderID: sdk.F(selected.ProviderID),
+		}),
+	})
+	if err != nil {
+		return "", fmt.Errorf("error sending prompt: %w", err)
+	}
+	return <-idleCh, nil
+}
+
+// RunReview sends a review prompt and returns the full streamed response.
+func RunReview(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string) (string, error) {
+	return streamSession(client, ctx, repoRoot, selected, prompt, true)
+}
+
+// RunFix sends fix prompts for all findings, commits and pushes any changes.
+// Returns the number of findings sent for fixing.
+func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int) int {
+	if len(findings) == 0 {
+		return 0
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "You are an automated code fixer. Apply ALL of the following fixes to the codebase.\n")
+	fmt.Fprintf(&sb, "Make minimal, targeted changes. Do not refactor unrelated code.\n")
+	fmt.Fprintf(&sb, "After applying all fixes, stop — do not explain or summarise.\n\n")
+	for i, f := range findings {
+		if f.AgentPrompt == "" {
+			continue
+		}
+		fmt.Fprintf(&sb, "--- Fix %d/%d [%s] %s:%s — %s ---\n", i+1, len(findings), f.Severity, f.File, f.LineRange, f.Title)
+		sb.WriteString(f.AgentPrompt)
+		sb.WriteString("\n\n")
+		if f.Diff != "" {
+			sb.WriteString("Suggested diff:\n```diff\n")
+			sb.WriteString(f.Diff)
+			sb.WriteString("\n```\n\n")
+		}
+	}
+
+	beforeStatus, err := git.StatusSnapshot(repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix status snapshot error: %v\n", err)
+		return 0
+	}
+
+	if _, err := streamSession(client, ctx, repoRoot, selected, sb.String(), true); err != nil {
+		fmt.Fprintf(os.Stderr, "Fix session error: %v\n", err)
+		return 0
+	}
+
+	afterStatus, err := git.StatusSnapshot(repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fix status snapshot error: %v\n", err)
+		return 0
+	}
+	stagePaths := git.FixerStagePaths(beforeStatus, afterStatus)
+	if len(stagePaths) == 0 {
+		fmt.Println("  (no file changes detected after fix)")
+		return 0
+	}
+	addArgs := append([]string{"add", "-u", "--"}, stagePaths...)
+	if _, err := git.Run(repoRoot, addArgs...); err != nil {
+		fmt.Fprintf(os.Stderr, "  git add failed: %v\n", err)
+		return 0
+	}
+	stagedArgs := append([]string{"diff", "--cached", "--name-only", "--"}, stagePaths...)
+	staged, _ := git.Run(repoRoot, stagedArgs...)
+	if staged == "" {
+		fmt.Println("  (no file changes detected after fix)")
+		return 0
+	}
+	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)
+	commitArgs := append([]string{"commit", "-m", msg, "--"}, stagePaths...)
+	if _, err := git.Run(repoRoot, commitArgs...); err != nil {
+		fmt.Fprintf(os.Stderr, "  git commit failed: %v\n", err)
+		return 0
+	}
+	branch, _ := git.Run(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if _, err := git.Run(repoRoot, "push", "origin", branch); err != nil {
+		fmt.Fprintf(os.Stderr, "  git push failed: %v\n", err)
+		return 0
+	}
+	fmt.Printf("  Committed and pushed fixes: %q\n", msg)
+	return len(findings)
+}
