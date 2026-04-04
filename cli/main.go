@@ -375,6 +375,17 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Not merging: verdict is %q (only merges on APPROVE)\n", verdict)
 			os.Exit(1)
 		}
+		// Safety: refuse --merge when reviewing a ref other than the current branch HEAD
+		// to avoid merging a different PR than the one being reviewed.
+		if *commitRef != "HEAD" {
+			currentHead, herr := gitRun(repoRoot, "rev-parse", "HEAD")
+			reviewedHash, rerr := gitRun(repoRoot, "rev-parse", *commitRef)
+			if herr != nil || rerr != nil || currentHead != reviewedHash {
+				fmt.Fprintf(os.Stderr, "Refusing to merge: --commit %q is not the current branch HEAD.\n", *commitRef)
+				fmt.Fprintln(os.Stderr, "Checkout the branch to merge, or omit --commit to review HEAD.")
+				os.Exit(1)
+			}
+		}
 		fmt.Printf("Merging PR (%s)...\n", *mergeStrategy)
 		if err := mergePR(repoRoot, *mergeStrategy, *deleteBranch); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to merge PR: %v\n", err)
@@ -385,15 +396,19 @@ func main() {
 }
 
 func mergePR(repoRoot, strategy string, deleteBranch bool) error {
-	args := []string{"pr", "merge"}
+	var strategyFlag string
 	switch strategy {
 	case "merge":
-		args = append(args, "--merge")
+		strategyFlag = "--merge"
+	case "squash":
+		strategyFlag = "--squash"
 	case "rebase":
-		args = append(args, "--rebase")
+		strategyFlag = "--rebase"
 	default:
-		args = append(args, "--squash")
+		return fmt.Errorf("invalid merge strategy %q: must be merge, squash, or rebase", strategy)
 	}
+
+	args := []string{"pr", "merge", strategyFlag}
 	if deleteBranch {
 		args = append(args, "--delete-branch")
 	}
