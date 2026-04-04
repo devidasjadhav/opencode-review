@@ -10,13 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	opencode "github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
 )
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 type ModelInfo struct {
 	ProviderID   string
@@ -24,6 +28,19 @@ type ModelInfo struct {
 	ModelID      string
 	ModelName    string
 }
+
+type Finding struct {
+	Severity    string // Critical / High / Medium / Low
+	File        string
+	LineRange   string
+	Title       string
+	Description string
+	Diff        string
+	AgentPrompt string
+	IssueNumber int // set after GitHub issue is created
+}
+
+// ── Git helpers ───────────────────────────────────────────────────────────────
 
 func gitRun(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
@@ -63,6 +80,8 @@ func getCommitInfo(root, ref string) (hash, subject, body, diff string, err erro
 	return
 }
 
+// ── Model helpers ─────────────────────────────────────────────────────────────
+
 func listModels(client *opencode.Client, ctx context.Context, dir string) ([]ModelInfo, error) {
 	providers, err := client.App.Providers(ctx, opencode.AppProvidersParams{
 		Directory: opencode.F(dir),
@@ -70,7 +89,6 @@ func listModels(client *opencode.Client, ctx context.Context, dir string) ([]Mod
 	if err != nil {
 		return nil, err
 	}
-
 	var models []ModelInfo
 	for _, provider := range providers.Providers {
 		ids := make([]string, 0, len(provider.Models))
@@ -96,7 +114,6 @@ func selectModel(models []ModelInfo) ModelInfo {
 	for i, m := range models {
 		fmt.Printf("  [%2d] %-20s %s\n", i+1, m.ProviderName, m.ModelName)
 	}
-
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("\nSelect model number: ")
@@ -112,6 +129,8 @@ func selectModel(models []ModelInfo) ModelInfo {
 	}
 }
 
+// ── Prompt builder ────────────────────────────────────────────────────────────
+
 func buildReviewPrompt(hash, subject, body, diff string) string {
 	var sb strings.Builder
 	sb.WriteString("Review the following git commit using the FULL project context and LSP info.\n")
@@ -125,21 +144,18 @@ func buildReviewPrompt(hash, subject, body, diff string) string {
 	sb.WriteString("Per-file bullet list: `file` — what changed and the intent.\n\n")
 
 	sb.WriteString("## Findings\n")
-	sb.WriteString("Only real, verifiable issues. For each finding use this format:\n\n")
+	sb.WriteString("Only real, verifiable issues. For each finding use EXACTLY this format:\n\n")
 	sb.WriteString("### `[🔴 Critical|🟠 High|🟡 Medium|🔵 Low]` file:line-range — Short title\n")
 	sb.WriteString("Clear description referencing the exact code and how it interacts with the rest of the codebase.\n\n")
-	sb.WriteString("```diff\n")
-	sb.WriteString("- old code\n")
-	sb.WriteString("+ fixed code\n")
-	sb.WriteString("```\n\n")
+	sb.WriteString("```diff\n- old code\n+ fixed code\n```\n\n")
 	sb.WriteString("**AI agent fix prompt:** One-paragraph instruction a coding agent can execute directly to fix this issue.\n\n")
-	sb.WriteString("If there are no issues: write `_No issues found._` and skip this section's subsections.\n\n")
+	sb.WriteString("If there are no issues: write `_No issues found._` and skip subsections.\n\n")
 
 	sb.WriteString("## Verdict\n")
-	sb.WriteString("Exactly one of these tokens on its own line, followed by one sentence reason:\n")
+	sb.WriteString("Exactly one token on its own line, followed by one sentence reason:\n")
 	sb.WriteString("`APPROVE` — safe to merge.\n")
 	sb.WriteString("`REQUEST CHANGES` — must fix before merge.\n")
-	sb.WriteString("`COMMENT` — observations only, no blocking issues.\n\n")
+	sb.WriteString("`COMMENT` — observations only.\n\n")
 
 	sb.WriteString("---\n")
 	fmt.Fprintf(&sb, "Commit: %s\n", hash)
@@ -152,12 +168,283 @@ func buildReviewPrompt(hash, subject, body, diff string) string {
 	return sb.String()
 }
 
-// streamResponse streams the response to stdout and returns the full text via doneCh.
-func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir string, idleCh chan string) {
+// ── Review parser ─────────────────────────────────────────────────────────────
+
+var findingHeader = regexp.MustCompile(
+	`(?i)###\s+` + "`" + `\[([^\]]+)\]` + "`" + `\s+(\S+):(\S*)\s+—\s+(.+)`,
+)
+
+func parseFindings(reviewText string) []Finding {
+	var findings []Finding
+	var current *Finding
+	var section string
+	var diffLines, agentLines []string
+	inDiff := false
+
+	flush := func() {
+		if current == nil {
+			return
+		}
+		current.Diff = strings.TrimSpace(strings.Join(diffLines, "\n"))
+		current.AgentPrompt = strings.TrimSpace(strings.Join(agentLines, "\n"))
+		current.AgentPrompt = strings.TrimPrefix(current.AgentPrompt, "**AI agent fix prompt:**")
+		current.AgentPrompt = strings.TrimSpace(current.AgentPrompt)
+		findings = append(findings, *current)
+		current = nil
+		diffLines = nil
+		agentLines = nil
+		inDiff = false
+	}
+
+	for _, line := range strings.Split(reviewText, "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		// Track top-level sections
+		if strings.HasPrefix(trimmed, "## ") {
+			flush()
+			section = strings.TrimPrefix(trimmed, "## ")
+			continue
+		}
+
+		if section != "Findings" {
+			continue
+		}
+
+		// New finding
+		if m := findingHeader.FindStringSubmatch(trimmed); m != nil {
+			flush()
+			sev := strings.TrimSpace(m[1])
+			// Normalise severity emoji → word
+			switch {
+			case strings.Contains(sev, "Critical"):
+				sev = "Critical"
+			case strings.Contains(sev, "High"):
+				sev = "High"
+			case strings.Contains(sev, "Medium"):
+				sev = "Medium"
+			default:
+				sev = "Low"
+			}
+			current = &Finding{
+				Severity:  sev,
+				File:      m[2],
+				LineRange: m[3],
+				Title:     strings.TrimSpace(m[4]),
+			}
+			continue
+		}
+
+		if current == nil {
+			continue
+		}
+
+		// Diff block
+		if trimmed == "```diff" {
+			inDiff = true
+			continue
+		}
+		if inDiff {
+			if trimmed == "```" {
+				inDiff = false
+			} else {
+				diffLines = append(diffLines, line)
+			}
+			continue
+		}
+
+		// AI agent fix prompt
+		if strings.HasPrefix(trimmed, "**AI agent fix prompt:**") {
+			rest := strings.TrimPrefix(trimmed, "**AI agent fix prompt:**")
+			agentLines = append(agentLines, strings.TrimSpace(rest))
+			continue
+		}
+		if len(agentLines) > 0 && trimmed != "" {
+			agentLines = append(agentLines, line)
+			continue
+		}
+
+		// Description
+		if trimmed != "" {
+			current.Description += line + "\n"
+		}
+	}
+	flush()
+	return findings
+}
+
+func extractVerdict(review string) string {
+	inVerdict := false
+	for _, line := range strings.Split(review, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## Verdict") {
+			inVerdict = true
+			continue
+		}
+		if inVerdict {
+			if strings.HasPrefix(trimmed, "##") {
+				break
+			}
+			if strings.Contains(trimmed, "REQUEST CHANGES") {
+				return "REQUEST CHANGES"
+			}
+			if strings.Contains(trimmed, "APPROVE") {
+				return "APPROVE"
+			}
+			if strings.Contains(trimmed, "COMMENT") {
+				return "COMMENT"
+			}
+		}
+	}
+	return "COMMENT"
+}
+
+// ── GitHub helpers ────────────────────────────────────────────────────────────
+
+func ghRun(dir string, args ...string) (string, error) {
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = dir
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("gh %s: %w\n%s", strings.Join(args, " "), err, errBuf.String())
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+func createIssue(repoRoot string, f Finding) (int, error) {
+	title := fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)
+	var body strings.Builder
+	fmt.Fprintf(&body, "## %s\n\n", f.Title)
+	fmt.Fprintf(&body, "**Severity:** %s  \n", f.Severity)
+	fmt.Fprintf(&body, "**Location:** `%s:%s`\n\n", f.File, f.LineRange)
+	body.WriteString("### Description\n")
+	body.WriteString(strings.TrimSpace(f.Description))
+	body.WriteString("\n\n")
+	if f.Diff != "" {
+		body.WriteString("### Suggested fix\n")
+		body.WriteString("```diff\n")
+		body.WriteString(f.Diff)
+		body.WriteString("\n```\n\n")
+	}
+	if f.AgentPrompt != "" {
+		body.WriteString("### AI agent fix prompt\n")
+		body.WriteString(f.AgentPrompt)
+		body.WriteString("\n")
+	}
+	body.WriteString("\n---\n_Reported by opencode-review_\n")
+
+	out, err := ghRun(repoRoot, "issue", "create",
+		"--title", title,
+		"--body", body.String(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	// Output is the issue URL, parse number from end
+	parts := strings.Split(strings.TrimRight(out, "/"), "/")
+	num, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		return 0, fmt.Errorf("cannot parse issue number from %q", out)
+	}
+	return num, nil
+}
+
+func closeIssue(repoRoot string, num int) error {
+	_, err := ghRun(repoRoot, "issue", "close", strconv.Itoa(num), "--comment", "Fixed and merged. Closing.")
+	return err
+}
+
+func linkIssuesToPR(repoRoot string, issueNums []int) error {
+	if len(issueNums) == 0 {
+		return nil
+	}
+	var closes []string
+	for _, n := range issueNums {
+		closes = append(closes, fmt.Sprintf("Closes #%d", n))
+	}
+	body, err := ghRun(repoRoot, "pr", "view", "--json", "body", "--jq", ".body")
+	if err != nil {
+		return err
+	}
+	// Append closes if not already there
+	newBody := body + "\n\n" + strings.Join(closes, "\n")
+	_, err = ghRun(repoRoot, "pr", "edit", "--body", newBody)
+	return err
+}
+
+func postGitHubPRReview(repoRoot, body, verdict string) error {
+	reviewFlag := "--comment"
+	switch {
+	case strings.Contains(verdict, "REQUEST CHANGES"):
+		reviewFlag = "--request-changes"
+	case strings.Contains(verdict, "APPROVE"):
+		reviewFlag = "--approve"
+	}
+
+	cmd := exec.Command("gh", "pr", "review", reviewFlag, "--body", body)
+	cmd.Dir = repoRoot
+	var errBuf bytes.Buffer
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = &errBuf
+
+	if err := cmd.Run(); err != nil {
+		if reviewFlag != "--comment" && strings.Contains(errBuf.String(), "own pull request") {
+			fmt.Fprintln(os.Stderr, "(falling back to --comment: cannot approve/request-changes own PR)")
+			cmd2 := exec.Command("gh", "pr", "review", "--comment", "--body", body)
+			cmd2.Dir = repoRoot
+			cmd2.Stdout = os.Stdout
+			cmd2.Stderr = os.Stderr
+			return cmd2.Run()
+		}
+		fmt.Fprint(os.Stderr, errBuf.String())
+		return err
+	}
+	return nil
+}
+
+func mergePR(repoRoot, strategy string, deleteBranch bool) error {
+	var strategyFlag string
+	switch strategy {
+	case "merge":
+		strategyFlag = "--merge"
+	case "squash":
+		strategyFlag = "--squash"
+	case "rebase":
+		strategyFlag = "--rebase"
+	default:
+		return fmt.Errorf("invalid merge strategy %q: must be merge, squash, or rebase", strategy)
+	}
+	args := []string{"pr", "merge", strategyFlag}
+	if deleteBranch {
+		args = append(args, "--delete-branch")
+	}
+	cmd := exec.Command("gh", args...)
+	cmd.Dir = repoRoot
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// ── Opencode stream ───────────────────────────────────────────────────────────
+
+func runReview(client *opencode.Client, ctx context.Context, repoRoot string, selected ModelInfo,
+	hash, subject, body, diff string) string {
+
+	session, err := client.Session.New(ctx, opencode.SessionNewParams{
+		Directory: opencode.F(repoRoot),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating session: %v\n", err)
+		os.Exit(1)
+	}
+	sessionID := session.ID
+
+	idleCh := make(chan string, 2)
 	streamCtx, cancel := context.WithCancel(ctx)
 
 	stream := client.Event.ListStreaming(streamCtx, opencode.EventListParams{
-		Directory: opencode.F(dir),
+		Directory: opencode.F(repoRoot),
 	})
 
 	go func() {
@@ -195,77 +482,41 @@ func streamResponse(client *opencode.Client, ctx context.Context, sessionID, dir
 			fmt.Fprintf(os.Stderr, "\nStream error: %v\n", err)
 		}
 	}()
+
+	prompt := buildReviewPrompt(hash, subject, body, diff)
+	_, err = client.Session.Prompt(ctx, sessionID, opencode.SessionPromptParams{
+		Directory: opencode.F(repoRoot),
+		Parts: opencode.F([]opencode.SessionPromptParamsPartUnion{
+			opencode.TextPartInputParam{
+				Text: opencode.F(prompt),
+				Type: opencode.F(opencode.TextPartInputTypeText),
+			},
+		}),
+		Model: opencode.F(opencode.SessionPromptParamsModel{
+			ModelID:    opencode.F(selected.ModelID),
+			ProviderID: opencode.F(selected.ProviderID),
+		}),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error sending prompt: %v\n", err)
+		os.Exit(1)
+	}
+	return <-idleCh
 }
 
-func postGitHubPRReview(repoRoot, body, verdict string) error {
-	// Try the matching review type; fall back to --comment if GitHub rejects it
-	// (e.g. you cannot approve/request-changes on your own PR).
-	reviewFlag := "--comment"
-	switch {
-	case strings.Contains(verdict, "REQUEST CHANGES"):
-		reviewFlag = "--request-changes"
-	case strings.Contains(verdict, "APPROVE"):
-		reviewFlag = "--approve"
-	}
-
-	cmd := exec.Command("gh", "pr", "review", reviewFlag, "--body", body)
-	cmd.Dir = repoRoot
-	var errBuf bytes.Buffer
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = &errBuf
-
-	if err := cmd.Run(); err != nil {
-		// GitHub rejects approve/request-changes on own PRs — retry as comment
-		if reviewFlag != "--comment" && strings.Contains(errBuf.String(), "own pull request") {
-			fmt.Fprintln(os.Stderr, "(falling back to --comment: cannot approve/request-changes own PR)")
-			cmd2 := exec.Command("gh", "pr", "review", "--comment", "--body", body)
-			cmd2.Dir = repoRoot
-			cmd2.Stdout = os.Stdout
-			cmd2.Stderr = os.Stderr
-			return cmd2.Run()
-		}
-		fmt.Fprint(os.Stderr, errBuf.String())
-		return err
-	}
-	return nil
-}
-
-func extractVerdict(review string) string {
-	// Only parse the ## Verdict section to avoid false matches in findings/summary.
-	inVerdict := false
-	for _, line := range strings.Split(review, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "## Verdict") {
-			inVerdict = true
-			continue
-		}
-		if inVerdict {
-			if strings.HasPrefix(trimmed, "##") {
-				break // next section
-			}
-			if strings.Contains(trimmed, "REQUEST CHANGES") {
-				return "REQUEST CHANGES"
-			}
-			if strings.Contains(trimmed, "APPROVE") {
-				return "APPROVE"
-			}
-			if strings.Contains(trimmed, "COMMENT") {
-				return "COMMENT"
-			}
-		}
-	}
-	return "COMMENT"
-}
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
 	serverURL := flag.String("url", "http://localhost:4096", "Opencode server URL")
-	dirFlag := flag.String("dir", "", "Git repo directory to review (default: current directory)")
-	modelNum := flag.Int("model", 0, "Model number from the list (skips interactive selection)")
-	postPR := flag.Bool("pr", false, "Post review as a GitHub PR comment (requires gh CLI)")
-	commitRef := flag.String("commit", "HEAD", "Git ref to review (commit hash, branch, tag)")
-	doMerge := flag.Bool("merge", false, "Merge the PR after posting review (only if verdict is APPROVE)")
+	dirFlag := flag.String("dir", "", "Git repo directory (default: current directory)")
+	modelNum := flag.Int("model", 0, "Model number from list (skips interactive selection)")
+	commitRef := flag.String("commit", "HEAD", "Git ref to review (hash, branch, tag)")
+	postPR := flag.Bool("pr", false, "Post review as GitHub PR comment")
+	createIssues := flag.Bool("issues", false, "Create GitHub issues for each finding")
+	loopMode := flag.Bool("loop", false, "Keep reviewing latest HEAD until APPROVE, then merge and close issues")
 	mergeStrategy := flag.String("merge-strategy", "squash", "Merge strategy: merge, squash, rebase")
 	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
+	loopInterval := flag.Duration("loop-interval", 30*time.Second, "How long to wait between loop iterations")
 	flag.Parse()
 
 	// Resolve directory
@@ -280,26 +531,15 @@ func main() {
 	}
 	dir, _ = filepath.Abs(dir)
 
-	// Resolve git repo root
 	repoRoot, err := resolveRepoRoot(dir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 
-	// Get commit info
-	hash, subject, body, diff, err := getCommitInfo(repoRoot, *commitRef)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading commit: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Reviewing commit: %s\n  %s\n\n", hash[:12], subject)
-
 	client := opencode.NewClient(option.WithBaseURL(*serverURL))
 	ctx := context.Background()
 
-	// List and select model
 	models, err := listModels(client, ctx, repoRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching models: %v\n", err)
@@ -318,103 +558,104 @@ func main() {
 	}
 	fmt.Printf("\nUsing: %s / %s\n\n", selected.ProviderName, selected.ModelName)
 
-	// Create session in the repo directory
-	session, err := client.Session.New(ctx, opencode.SessionNewParams{
-		Directory: opencode.F(repoRoot),
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating session: %v\n", err)
-		os.Exit(1)
-	}
-	sessionID := session.ID
+	// Track open issues across loop iterations
+	var openIssues []int
+	iteration := 0
 
-	// Start event stream
-	idleCh := make(chan string, 2)
-	streamResponse(client, ctx, sessionID, repoRoot, idleCh)
+	for {
+		iteration++
+		ref := *commitRef
+		if *loopMode && iteration > 1 {
+			ref = "HEAD" // always review latest after first pass
+		}
 
-	// Send review prompt
-	prompt := buildReviewPrompt(hash, subject, body, diff)
-	fmt.Println("--- Code Review ---\n")
-
-	_, err = client.Session.Prompt(ctx, sessionID, opencode.SessionPromptParams{
-		Directory: opencode.F(repoRoot),
-		Parts: opencode.F([]opencode.SessionPromptParamsPartUnion{
-			opencode.TextPartInputParam{
-				Text: opencode.F(prompt),
-				Type: opencode.F(opencode.TextPartInputTypeText),
-			},
-		}),
-		Model: opencode.F(opencode.SessionPromptParamsModel{
-			ModelID:    opencode.F(selected.ModelID),
-			ProviderID: opencode.F(selected.ProviderID),
-		}),
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error sending prompt: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Wait for response to complete
-	reviewText := <-idleCh
-
-	verdict := extractVerdict(reviewText)
-
-	// Optionally post to GitHub PR
-	if *postPR && reviewText != "" {
-		fmt.Printf("Posting to GitHub PR (%s)...\n", verdict)
-		if err := postGitHubPRReview(repoRoot, reviewText, verdict); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to post PR review: %v\n", err)
+		hash, subject, body, diff, err := getCommitInfo(repoRoot, ref)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading commit: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("Posted.")
-	}
 
-	// Optionally merge if verdict is APPROVE
-	if *doMerge {
-		if verdict != "APPROVE" {
-			fmt.Fprintf(os.Stderr, "Not merging: verdict is %q (only merges on APPROVE)\n", verdict)
-			os.Exit(1)
-		}
-		// Safety: refuse --merge when reviewing a ref other than the current branch HEAD
-		// to avoid merging a different PR than the one being reviewed.
-		if *commitRef != "HEAD" {
-			currentHead, herr := gitRun(repoRoot, "rev-parse", "HEAD")
-			reviewedHash, rerr := gitRun(repoRoot, "rev-parse", *commitRef)
-			if herr != nil || rerr != nil || currentHead != reviewedHash {
-				fmt.Fprintf(os.Stderr, "Refusing to merge: --commit %q is not the current branch HEAD.\n", *commitRef)
-				fmt.Fprintln(os.Stderr, "Checkout the branch to merge, or omit --commit to review HEAD.")
-				os.Exit(1)
+		fmt.Printf("─── Iteration %d — reviewing %s\n  %s\n\n", iteration, hash[:12], subject)
+		fmt.Println("--- Code Review ---\n")
+
+		reviewText := runReview(client, ctx, repoRoot, selected, hash, subject, body, diff)
+		verdict := extractVerdict(reviewText)
+
+		// Post PR review comment
+		if *postPR && reviewText != "" {
+			fmt.Printf("Posting PR review (%s)...\n", verdict)
+			if err := postGitHubPRReview(repoRoot, reviewText, verdict); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to post PR review: %v\n", err)
+			} else {
+				fmt.Println("Posted.")
 			}
 		}
-		fmt.Printf("Merging PR (%s)...\n", *mergeStrategy)
-		if err := mergePR(repoRoot, *mergeStrategy, *deleteBranch); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to merge PR: %v\n", err)
-			os.Exit(1)
+
+		// Create GitHub issues for each finding
+		if *createIssues && reviewText != "" {
+			findings := parseFindings(reviewText)
+			if len(findings) > 0 {
+				fmt.Printf("\nCreating %d GitHub issue(s)...\n", len(findings))
+				var newIssues []int
+				for _, f := range findings {
+					num, err := createIssue(repoRoot, f)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "  Failed to create issue for %q: %v\n", f.Title, err)
+						continue
+					}
+					fmt.Printf("  #%d [%s] %s:%s — %s\n", num, f.Severity, f.File, f.LineRange, f.Title)
+					newIssues = append(newIssues, num)
+					openIssues = append(openIssues, num)
+				}
+				// Link new issues to PR
+				if *postPR && len(newIssues) > 0 {
+					if err := linkIssuesToPR(repoRoot, newIssues); err != nil {
+						fmt.Fprintf(os.Stderr, "  Failed to link issues to PR: %v\n", err)
+					} else {
+						fmt.Println("  Issues linked to PR.")
+					}
+				}
+			} else {
+				fmt.Println("\nNo findings to create issues for.")
+			}
 		}
-		fmt.Println("Merged.")
-	}
-}
 
-func mergePR(repoRoot, strategy string, deleteBranch bool) error {
-	var strategyFlag string
-	switch strategy {
-	case "merge":
-		strategyFlag = "--merge"
-	case "squash":
-		strategyFlag = "--squash"
-	case "rebase":
-		strategyFlag = "--rebase"
-	default:
-		return fmt.Errorf("invalid merge strategy %q: must be merge, squash, or rebase", strategy)
-	}
+		fmt.Printf("\nVerdict: %s\n", verdict)
 
-	args := []string{"pr", "merge", strategyFlag}
-	if deleteBranch {
-		args = append(args, "--delete-branch")
+		// Exit loop conditions
+		if !*loopMode {
+			break
+		}
+
+		if verdict == "APPROVE" {
+			fmt.Println("\nAll issues resolved — merging PR...")
+			// Safety: must be reviewing HEAD of current branch
+			currentHead, _ := gitRun(repoRoot, "rev-parse", "HEAD")
+			if hash != currentHead {
+				fmt.Fprintln(os.Stderr, "Refusing to merge: reviewed commit is not current HEAD.")
+				os.Exit(1)
+			}
+			if err := mergePR(repoRoot, *mergeStrategy, *deleteBranch); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to merge: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("Merged.")
+
+			// Close all tracked issues
+			if len(openIssues) > 0 {
+				fmt.Printf("Closing %d issue(s)...\n", len(openIssues))
+				for _, n := range openIssues {
+					if err := closeIssue(repoRoot, n); err != nil {
+						fmt.Fprintf(os.Stderr, "  Failed to close #%d: %v\n", n, err)
+					} else {
+						fmt.Printf("  Closed #%d\n", n)
+					}
+				}
+			}
+			break
+		}
+
+		fmt.Printf("\nWaiting %s for fixes before next review...\n", *loopInterval)
+		time.Sleep(*loopInterval)
 	}
-	cmd := exec.Command("gh", args...)
-	cmd.Dir = repoRoot
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }
