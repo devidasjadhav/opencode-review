@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -52,23 +53,29 @@ func ListModels(client *sdk.Client, ctx context.Context, dir string) ([]types.Mo
 }
 
 // SelectModel prompts the user interactively to choose a model.
-func SelectModel(models []types.ModelInfo) types.ModelInfo {
+func SelectModel(models []types.ModelInfo) (types.ModelInfo, error) {
 	fmt.Println("Available models:")
 	for i, m := range models {
 		fmt.Printf("  [%2d] %-20s %s\n", i+1, m.ProviderName, m.ModelName)
 	}
 	scanner := bufio.NewScanner(os.Stdin)
+	const maxInvalidAttempts = 5
+	invalidAttempts := 0
 	for {
 		fmt.Print("\nSelect model number: ")
 		if !scanner.Scan() {
-			os.Exit(0)
+			return types.ModelInfo{}, io.EOF
 		}
 		n, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
 		if err != nil || n < 1 || n > len(models) {
+			invalidAttempts++
+			if invalidAttempts >= maxInvalidAttempts {
+				return types.ModelInfo{}, fmt.Errorf("failed to parse model selection after %d attempts", maxInvalidAttempts)
+			}
 			fmt.Printf("  Enter a number between 1 and %d\n", len(models))
 			continue
 		}
-		return models[n-1]
+		return models[n-1], nil
 	}
 }
 

@@ -68,13 +68,16 @@ func ListOpenIssues(ctx context.Context, gh *gogithub.Client, owner, repo string
 }
 
 // ExistingIssueTitles returns a set of open issue titles for deduplication.
-func ExistingIssueTitles(ctx context.Context, gh *gogithub.Client, owner, repo string) map[string]bool {
-	issues, _ := ListOpenIssues(ctx, gh, owner, repo)
+func ExistingIssueTitles(ctx context.Context, gh *gogithub.Client, owner, repo string) (map[string]bool, error) {
+	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	if err != nil {
+		return nil, err
+	}
 	seen := make(map[string]bool, len(issues))
 	for _, i := range issues {
 		seen[i.GetTitle()] = true
 	}
-	return seen
+	return seen, nil
 }
 
 // FindingIssueTitle returns the canonical GitHub issue title for a finding.
