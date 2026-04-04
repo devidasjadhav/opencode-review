@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	gogithub "github.com/google/go-github/v67/github"
@@ -78,11 +77,11 @@ func Run() {
 		fmt.Printf("Created and pushed branch %q\n", newBranch)
 	}
 
-	// GitHub client — required for --pr, --issues, --loop, --merge
+	// GitHub client — required for --pr, --issues, --loop, --merge, --validate-issues
 	var ghClient *gogithub.Client
 	var ghOwner, ghRepo string
 	var ghPRNum int
-	if *postPR || *createIssues || *loopMode || *mergeOnApprove {
+	if needsGitHubClient(*postPR, *createIssues, *loopMode, *mergeOnApprove, *validateIssues) {
 		ghClient, err = gh.NewClient(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "GitHub: %v\n", err)
@@ -115,22 +114,7 @@ func Run() {
 
 	// Validate open issues against current codebase before proceeding.
 	if *validateIssues && ghClient != nil {
-		fmt.Println("Validating open issues against current codebase...")
-		validations, verr := gh.ValidateIssues(ctx, ghClient, ghOwner, ghRepo, repoRoot)
-		if verr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: issue validation failed: %v\n", verr)
-		} else {
-			for _, v := range validations {
-				if v.Valid {
-					fmt.Printf("  #%d ✓ %s\n    %s\n", v.Number, v.Title, v.Reason)
-				} else {
-					fmt.Printf("  #%d ✗ STALE — %s\n    Closing: %s\n", v.Number, v.Title, v.Reason)
-					comment := fmt.Sprintf("Closing as stale: %s", v.Reason)
-					_ = gh.CommentOnIssue(ctx, ghClient, ghOwner, ghRepo, v.Number, comment)
-					_ = gh.CloseIssue(ctx, ghClient, ghOwner, ghRepo, v.Number)
-				}
-			}
-		}
+		runIssueValidation(ctx, *validateIssues, ghClient, ghOwner, ghRepo, repoRoot, gh.ValidateIssues)
 		fmt.Println()
 	}
 
@@ -266,6 +250,39 @@ func normalizeLoopFlags(loopMode, mergeOnApprove, autoFix *bool, loopInterval *t
 	}
 }
 
+func needsGitHubClient(postPR, createIssues, loopMode, mergeOnApprove, validateIssues bool) bool {
+	return postPR || createIssues || loopMode || mergeOnApprove || validateIssues
+}
+
+func runIssueValidation(ctx context.Context, validate bool, ghClient *gogithub.Client,
+	owner, repo, repoRoot string,
+	validateFn func(context.Context, *gogithub.Client, string, string, string) ([]gh.IssueValidity, error)) {
+
+	if !validate || ghClient == nil {
+		return
+	}
+	fmt.Println("Validating open issues against current codebase...")
+	validations, err := validateFn(ctx, ghClient, owner, repo, repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: issue validation failed: %v\n", err)
+		return
+	}
+	for _, v := range validations {
+		if v.Valid {
+			fmt.Printf("  #%d ✓ %s\n    %s\n", v.Number, v.Title, v.Reason)
+		} else {
+			fmt.Printf("  #%d ✗ STALE — %s\n    Closing: %s\n", v.Number, v.Title, v.Reason)
+			comment := fmt.Sprintf("Closing as stale: %s", v.Reason)
+			if err := gh.CommentOnIssue(ctx, ghClient, owner, repo, v.Number, comment); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: failed to comment on #%d: %v\n", v.Number, err)
+			}
+			if err := gh.CloseIssue(ctx, ghClient, owner, repo, v.Number); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: failed to close #%d: %v\n", v.Number, err)
+			}
+		}
+	}
+}
+
 // fileIssues creates GitHub issues for new findings, deduplicating via live API.
 func fileIssues(ctx context.Context, ghClient *gogithub.Client, owner, repo string, prNum int,
 	reviewText string, openIssues []int, log *logger.Logger) []int {
@@ -336,19 +353,11 @@ func mergeAndClose(ctx context.Context, ghClient *gogithub.Client, owner, repo s
 		return
 	}
 
+	// Only close issues filed in this run. Never sweep unrelated opencode-review
+	// issues from other runs — those may not have been fixed by this PR.
 	closeNums := map[int]bool{}
 	for _, n := range openIssues {
 		closeNums[n] = true
-	}
-	allIssues, err := gh.ListOpenIssues(ctx, ghClient, owner, repo)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to list open issues: %v\n", err)
-		os.Exit(1)
-	}
-	for _, issue := range allIssues {
-		if strings.Contains(issue.GetBody(), "_Reported by opencode-review_") {
-			closeNums[issue.GetNumber()] = true
-		}
 	}
 
 	var closeFailed bool
