@@ -115,12 +115,8 @@ func CreateIssue(ctx context.Context, gh *gogithub.Client, owner, repo string, f
 	return issue.GetNumber(), nil
 }
 
-// CloseIssue adds a closing comment then closes the issue.
+// CloseIssue closes issue state only.
 func CloseIssue(ctx context.Context, gh *gogithub.Client, owner, repo string, num int) error {
-	comment := "Fixed and merged. Closing."
-	if _, _, err := gh.Issues.CreateComment(ctx, owner, repo, num, &gogithub.IssueComment{Body: &comment}); err != nil {
-		return err
-	}
 	state := "closed"
 	_, _, err := gh.Issues.Edit(ctx, owner, repo, num, &gogithub.IssueRequest{State: &state})
 	return err
@@ -253,10 +249,10 @@ var issueLocRe = regexp.MustCompile(`\]\s+(\S+):(\d+)`)
 
 // IssueValidity reports whether a GitHub issue is still applicable to the current code.
 type IssueValidity struct {
-	Number  int
-	Title   string
-	Valid   bool
-	Reason  string
+	Number int
+	Title  string
+	Valid  bool
+	Reason string
 }
 
 // ValidateIssues checks each open opencode-review issue against the current codebase.
