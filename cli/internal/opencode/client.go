@@ -165,7 +165,62 @@ func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected t
 	if len(findings) == 0 {
 		return 0
 	}
+	prompt := buildFixPrompt(findings)
+	applyResult, err := applyFixPrompt(client, ctx, repoRoot, selected, prompt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 0
+	}
+	if applyResult.Outcome != fixApplyChanged {
+		fmt.Println("  (no file changes detected after fix)")
+		return 0
+	}
+	persistResult, err := stageCommitPushFixes(repoRoot, findings, iteration, applyResult.StagePaths)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 0
+	}
+	if persistResult.Outcome != fixPersistCommitted {
+		return 0
+	}
+	fmt.Printf("  Committed and pushed fixes: %q\n", persistResult.CommitMessage)
+	return len(findings)
+}
 
+type fixApplyOutcome int
+
+const (
+	fixApplyNoChanges fixApplyOutcome = iota
+	fixApplyChanged
+)
+
+type fixApplyResult struct {
+	Outcome    fixApplyOutcome
+	StagePaths []string
+}
+
+type fixPersistOutcome int
+
+const (
+	fixPersistNoop fixPersistOutcome = iota
+	fixPersistCommitted
+)
+
+type fixPersistResult struct {
+	Outcome       fixPersistOutcome
+	CommitMessage string
+}
+
+type runFixError struct {
+	Context string
+	Err     error
+}
+
+func (e runFixError) Error() string {
+	return fmt.Sprintf("%s: %v", e.Context, e.Err)
+}
+
+func buildFixPrompt(findings []types.Finding) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "You are an automated code fixer. Apply ALL of the following fixes to the codebase.\n")
 	fmt.Fprintf(&sb, "Make minimal, targeted changes. Do not refactor unrelated code.\n")
@@ -183,29 +238,29 @@ func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected t
 			sb.WriteString("\n```\n\n")
 		}
 	}
+	return sb.String()
+}
 
+func applyFixPrompt(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string) (fixApplyResult, error) {
 	beforeStatus, err := git.StatusSnapshot(repoRoot)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Fix status snapshot error: %v\n", err)
-		return 0
+		return fixApplyResult{}, runFixError{Context: "Fix status snapshot error", Err: err}
 	}
-
-	if _, err := streamSession(client, ctx, repoRoot, selected, sb.String(), true); err != nil {
-		fmt.Fprintf(os.Stderr, "Fix session error: %v\n", err)
-		return 0
+	if _, err := streamSession(client, ctx, repoRoot, selected, prompt, true); err != nil {
+		return fixApplyResult{}, runFixError{Context: "Fix session error", Err: err}
 	}
-
 	afterStatus, err := git.StatusSnapshot(repoRoot)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Fix status snapshot error: %v\n", err)
-		return 0
+		return fixApplyResult{}, runFixError{Context: "Fix status snapshot error", Err: err}
 	}
 	stagePaths := git.FixerStagePaths(beforeStatus, afterStatus)
 	if len(stagePaths) == 0 {
-		fmt.Println("  (no file changes detected after fix)")
-		return 0
+		return fixApplyResult{Outcome: fixApplyNoChanges}, nil
 	}
-	// Validate paths exist before staging to catch any path corruption bugs.
+	return fixApplyResult{Outcome: fixApplyChanged, StagePaths: stagePaths}, nil
+}
+
+func stageCommitPushFixes(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error) {
 	var validPaths []string
 	for _, p := range stagePaths {
 		abs := filepath.Join(repoRoot, p)
@@ -217,30 +272,26 @@ func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected t
 	}
 	if len(validPaths) == 0 {
 		fmt.Println("  (no valid paths to stage after fix)")
-		return 0
+		return fixPersistResult{Outcome: fixPersistNoop}, nil
 	}
 	addArgs := append([]string{"add", "-u", "--"}, validPaths...)
 	if _, err := git.Run(repoRoot, addArgs...); err != nil {
-		fmt.Fprintf(os.Stderr, "  git add failed: %v\n", err)
-		return 0
+		return fixPersistResult{}, runFixError{Context: "  git add failed", Err: err}
 	}
 	stagedArgs := append([]string{"diff", "--cached", "--name-only", "--"}, validPaths...)
 	staged, _ := git.Run(repoRoot, stagedArgs...)
 	if staged == "" {
 		fmt.Println("  (no file changes detected after fix)")
-		return 0
+		return fixPersistResult{Outcome: fixPersistNoop}, nil
 	}
 	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)
 	commitArgs := append([]string{"commit", "-m", msg, "--"}, validPaths...)
 	if _, err := git.Run(repoRoot, commitArgs...); err != nil {
-		fmt.Fprintf(os.Stderr, "  git commit failed: %v\n", err)
-		return 0
+		return fixPersistResult{}, runFixError{Context: "  git commit failed", Err: err}
 	}
 	branch, _ := git.Run(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	if _, err := git.Run(repoRoot, "push", "origin", branch); err != nil {
-		fmt.Fprintf(os.Stderr, "  git push failed: %v\n", err)
-		return 0
+		return fixPersistResult{}, runFixError{Context: "  git push failed", Err: err}
 	}
-	fmt.Printf("  Committed and pushed fixes: %q\n", msg)
-	return len(findings)
+	return fixPersistResult{Outcome: fixPersistCommitted, CommitMessage: msg}, nil
 }
