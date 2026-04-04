@@ -796,23 +796,52 @@ func main() {
 			fmt.Println("Merged.")
 			writeLog(map[string]any{"ts": time.Now().Format(time.RFC3339), "action": "pr_merged", "strategy": *mergeStrategy})
 
-			// Close all tracked issues; exit non-zero if any fail
-			var closeFailed bool
-			if len(openIssues) > 0 {
-				fmt.Printf("Closing %d issue(s)...\n", len(openIssues))
+			// Close all open issues (current run + any from previous runs on this repo)
+			if *createIssues {
+				allOpen := existingIssues(ctx, gh, ghOwner, ghRepo)
+				// Merge in any created this run that may not yet appear in the API list
 				for _, n := range openIssues {
-					if err := closeIssue(ctx, gh, ghOwner, ghRepo, n); err != nil {
-						fmt.Fprintf(os.Stderr, "  Failed to close #%d: %v\n", n, err)
-						closeFailed = true
-					} else {
-						fmt.Printf("  Closed #%d\n", n)
-						writeLog(map[string]any{"ts": time.Now().Format(time.RFC3339), "action": "issue_closed", "issue": n})
+					allOpen[fmt.Sprintf("__num_%d", n)] = true
+				}
+				// Build deduplicated close list: current-run nums + any open issues by number
+				closeNums := map[int]bool{}
+				for _, n := range openIssues {
+					closeNums[n] = true
+				}
+				// Also fetch open issues by number for ones not created this run
+				opts := &github.IssueListByRepoOptions{State: "open", ListOptions: github.ListOptions{PerPage: 100}}
+				for {
+					issues, resp, err2 := gh.Issues.ListByRepo(ctx, ghOwner, ghRepo, opts)
+					if err2 != nil {
+						break
+					}
+					for _, issue := range issues {
+						if issue.PullRequestLinks == nil {
+							closeNums[issue.GetNumber()] = true
+						}
+					}
+					if resp.NextPage == 0 {
+						break
+					}
+					opts.Page = resp.NextPage
+				}
+				var closeFailed bool
+				if len(closeNums) > 0 {
+					fmt.Printf("Closing %d issue(s)...\n", len(closeNums))
+					for n := range closeNums {
+						if err := closeIssue(ctx, gh, ghOwner, ghRepo, n); err != nil {
+							fmt.Fprintf(os.Stderr, "  Failed to close #%d: %v\n", n, err)
+							closeFailed = true
+						} else {
+							fmt.Printf("  Closed #%d\n", n)
+							writeLog(map[string]any{"ts": time.Now().Format(time.RFC3339), "action": "issue_closed", "issue": n})
+						}
 					}
 				}
-			}
-			if closeFailed {
-				fmt.Fprintln(os.Stderr, "Warning: some issues could not be closed.")
-				os.Exit(1)
+				if closeFailed {
+					fmt.Fprintln(os.Stderr, "Warning: some issues could not be closed.")
+					os.Exit(1)
+				}
 			}
 			break
 		}
