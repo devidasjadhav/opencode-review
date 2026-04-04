@@ -208,6 +208,40 @@ func selectModel(models []ModelInfo) ModelInfo {
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
 
+func buildAuditPrompt(repoRoot string) (string, error) {
+	var sb strings.Builder
+	sb.WriteString("Perform a full SOLID and DRY audit of this codebase.\n")
+	sb.WriteString("Read ALL files below in full. For every violation report EXACTLY:\n\n")
+	sb.WriteString("### `[🔴 Critical|🟠 High|🟡 Medium|🔵 Low]` file:line-range — Short title\n")
+	sb.WriteString("Which principle is violated and why, referencing exact code.\n\n")
+	sb.WriteString("```diff\n- old code\n+ fixed code\n```\n\n")
+	sb.WriteString("**AI agent fix prompt:** One-paragraph instruction to fix this.\n\n")
+	sb.WriteString("## Findings\n")
+	sb.WriteString("(list all findings above — if none write `_No issues found._`)\n\n")
+	sb.WriteString("## Verdict\n")
+	sb.WriteString("`APPROVE` — no violations found.\n")
+	sb.WriteString("`REQUEST CHANGES` — violations must be fixed.\n\n")
+	sb.WriteString("---\n")
+
+	// Append all .go source files (excluding test files)
+	matches, err := filepath.Glob(filepath.Join(repoRoot, "cli", "*.go"))
+	if err != nil {
+		return "", err
+	}
+	for _, f := range matches {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		content, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		rel, _ := filepath.Rel(repoRoot, f)
+		fmt.Fprintf(&sb, "\n### File: %s\n```go\n%s\n```\n", rel, string(content))
+	}
+	return sb.String(), nil
+}
+
 func buildReviewPrompt(hash, subject, body, diff string) string {
 	var sb strings.Builder
 	sb.WriteString("Review the following git commit using the FULL project context and LSP info.\n")
@@ -573,8 +607,7 @@ func openPRNumber(ctx context.Context, gh *github.Client, owner, repo, repoRoot 
 
 // ── Opencode stream ───────────────────────────────────────────────────────────
 
-func runReview(client *opencode.Client, ctx context.Context, repoRoot string, selected ModelInfo,
-	hash, subject, body, diff string) (string, error) {
+func runReview(client *opencode.Client, ctx context.Context, repoRoot string, selected ModelInfo, prompt string) (string, error) {
 
 	session, err := client.Session.New(ctx, opencode.SessionNewParams{
 		Directory: opencode.F(repoRoot),
@@ -635,7 +668,6 @@ func runReview(client *opencode.Client, ctx context.Context, repoRoot string, se
 		}
 	}()
 
-	prompt := buildReviewPrompt(hash, subject, body, diff)
 	_, err = client.Session.Prompt(ctx, sessionID, opencode.SessionPromptParams{
 		Directory: opencode.F(repoRoot),
 		Parts: opencode.F([]opencode.SessionPromptParamsPartUnion{
@@ -804,6 +836,7 @@ func main() {
 	dirFlag := flag.String("dir", "", "Git repo directory (default: current directory)")
 	modelNum := flag.Int("model", 0, "Model number from list (skips interactive selection)")
 	commitRef := flag.String("commit", "HEAD", "Git ref to review (hash, branch, tag)")
+	auditMode := flag.Bool("audit", false, "Full SOLID/DRY audit of entire codebase instead of single commit review")
 	postPR := flag.Bool("pr", false, "Post review as GitHub PR comment")
 	createIssues := flag.Bool("issues", false, "Create GitHub issues for each finding")
 	loopMode := flag.Bool("loop", false, "Keep reviewing latest HEAD until APPROVE, then merge and close issues")
@@ -935,7 +968,18 @@ func main() {
 		fmt.Printf("─── Iteration %d — reviewing %s\n  %s\n\n", iteration, hash[:12], subject)
 		fmt.Println("--- Code Review ---\n")
 
-		reviewText, err := runReview(client, ctx, repoRoot, selected, hash, subject, body, diff)
+		var reviewPrompt string
+		if *auditMode {
+			reviewPrompt, err = buildAuditPrompt(repoRoot)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Audit prompt error: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			reviewPrompt = buildReviewPrompt(hash, subject, body, diff)
+		}
+
+		reviewText, err := runReview(client, ctx, repoRoot, selected, reviewPrompt)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Review failed: %v\n", err)
 			os.Exit(1)
