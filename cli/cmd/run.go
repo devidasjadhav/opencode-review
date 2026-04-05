@@ -82,24 +82,27 @@ func run() error {
 }
 
 func parseFlags() runConfig {
-	serverURL := flag.String("url", "http://localhost:4096", "Opencode server URL")
+	// Load .env defaults before registering flags so CLI flags override them.
+	env := loadEnvFile(resolveRootForEnv(prescanDir()))
+
+	serverURL := flag.String("url", envOr(env, "URL", "http://localhost:4096"), "Opencode server URL")
 	dirFlag := flag.String("dir", "", "Git repo directory (default: current directory)")
-	modelNum := flag.Int("model", 0, "Model number from list (skips interactive selection)")
+	modelNum := flag.Int("model", envInt(env, "MODEL", 0), "Model number from list (skips interactive selection)")
 	commitRef := flag.String("commit", "HEAD", "Git ref to review (hash, branch, tag)")
-	auditMode := flag.Bool("audit", false, "Full SOLID/DRY audit of entire codebase instead of single commit review")
-	postPR := flag.Bool("pr", false, "Post review as GitHub PR comment")
-	createIssues := flag.Bool("issues", false, "Create GitHub issues for each finding")
-	loopMode := flag.Bool("loop", false, "Keep reviewing latest HEAD until APPROVE, then merge and close issues")
-	autoFix := flag.Bool("auto-fix", false, "Automatically apply AI fixes between loop iterations (requires --loop)")
-	mergeOnApprove := flag.Bool("merge", false, "Merge PR immediately if this review is APPROVE (one-shot)")
-	mergeStrategy := flag.String("merge-strategy", types.DefaultMergeStrategy, fmt.Sprintf("Merge strategy: %s", types.AllowedMergeStrategies()))
-	deleteBranch := flag.Bool("delete-branch", false, "Delete branch after merge")
-	loopInterval := flag.Duration("loop-interval", 30*time.Second, "Wait between loop iterations")
-	baseBranch := flag.String("base", "master", "Base branch for auto-created PRs")
-	createBranch := flag.Bool("create-branch", false, "Create a new fix branch from current HEAD and push before opening PR")
-	validateIssues := flag.Bool("validate-issues", false, "Check open issues against current code and close stale ones before fixing")
-	minConfidence := flag.String("min-confidence", "MEDIUM", "Minimum confidence level to auto-fix: HIGH, MEDIUM, or LOW")
-	verifierModelNum := flag.Int("verifier-model", 0, "Model number to use as independent fix verifier (0 = disabled)")
+	auditMode := flag.Bool("audit", envBool(env, "AUDIT", false), "Full SOLID/DRY audit of entire codebase instead of single commit review")
+	postPR := flag.Bool("pr", envBool(env, "PR", false), "Post review as GitHub PR comment")
+	createIssues := flag.Bool("issues", envBool(env, "ISSUES", false), "Create GitHub issues for each finding")
+	loopMode := flag.Bool("loop", envBool(env, "LOOP", false), "Keep reviewing latest HEAD until APPROVE, then merge and close issues")
+	autoFix := flag.Bool("auto-fix", envBool(env, "AUTO_FIX", false), "Automatically apply AI fixes between loop iterations (requires --loop)")
+	mergeOnApprove := flag.Bool("merge", envBool(env, "MERGE", false), "Merge PR immediately if this review is APPROVE (one-shot)")
+	mergeStrategy := flag.String("merge-strategy", envOr(env, "MERGE_STRATEGY", types.DefaultMergeStrategy), fmt.Sprintf("Merge strategy: %s", types.AllowedMergeStrategies()))
+	deleteBranch := flag.Bool("delete-branch", envBool(env, "DELETE_BRANCH", false), "Delete branch after merge")
+	loopInterval := flag.Duration("loop-interval", envDuration(env, "LOOP_INTERVAL", 30*time.Second), "Wait between loop iterations")
+	baseBranch := flag.String("base", envOr(env, "BASE", "master"), "Base branch for auto-created PRs")
+	createBranch := flag.Bool("create-branch", envBool(env, "CREATE_BRANCH", false), "Create a new fix branch from current HEAD and push before opening PR")
+	validateIssues := flag.Bool("validate-issues", envBool(env, "VALIDATE_ISSUES", false), "Check open issues against current code and close stale ones before fixing")
+	minConfidence := flag.String("min-confidence", envOr(env, "MIN_CONFIDENCE", "MEDIUM"), "Minimum confidence level to auto-fix: HIGH, MEDIUM, or LOW")
+	verifierModelNum := flag.Int("verifier-model", envInt(env, "VERIFIER_MODEL", 0), "Model number to use as independent fix verifier (0 = disabled)")
 	flag.Parse()
 
 	return runConfig{

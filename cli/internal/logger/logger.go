@@ -32,9 +32,18 @@ func (l *Logger) Write(record any) {
 	if l.f == nil {
 		return
 	}
-	b, _ := json.Marshal(record)
-	l.f.Write(b)
-	l.f.Write([]byte("\n"))
+	b, err := json.Marshal(record)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: log marshal error: %v\n", err)
+		return
+	}
+	if _, err := l.f.Write(b); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: log write error: %v\n", err)
+		return
+	}
+	if _, err := l.f.Write([]byte("\n")); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: log write error: %v\n", err)
+	}
 }
 
 // Close flushes and closes the log file.

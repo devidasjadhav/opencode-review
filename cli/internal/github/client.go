@@ -224,7 +224,9 @@ func MergePR(ctx context.Context, gh *gogithub.Client, owner, repo string, prNum
 	if deleteBranch {
 		pr, _, err2 := gh.PullRequests.Get(ctx, owner, repo, prNum)
 		if err2 == nil && pr.Head != nil && pr.Head.Ref != nil {
-			gh.Git.DeleteRef(ctx, owner, repo, "heads/"+pr.Head.GetRef()) //nolint
+			if _, err2 = gh.Git.DeleteRef(ctx, owner, repo, "heads/"+pr.Head.GetRef()); err2 != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to delete branch %q: %v\n", pr.Head.GetRef(), err2)
+			}
 		}
 	}
 	return nil
@@ -336,6 +338,12 @@ func ValidateIssues(ctx context.Context, gh *gogithub.Client, owner, repo, repoR
 			lineCount++
 		}
 		f.Close()
+		if err := scanner.Err(); err != nil {
+			v.Valid = true
+			v.Reason = fmt.Sprintf("could not fully read %q: %v — assuming still valid", relFile, err)
+			results = append(results, v)
+			continue
+		}
 
 		if startLine > lineCount {
 			v.Valid = false
