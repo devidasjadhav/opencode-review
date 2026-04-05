@@ -121,8 +121,12 @@ func postPRReviewIfRequested(ctx context.Context, ghCtx githubContext, cfg runCo
 	fmt.Println("Posted.")
 }
 
+func canMergeOnApprove(cfg runConfig, verdict string) bool {
+	return cfg.mergeOnApprove && verdict == "APPROVE"
+}
+
 func maybeMergeOnApprove(env runEnvironment, ghCtx githubContext, cfg runConfig, result iterationResult, openIssues []int) (bool, error) {
-	if result.verdict != "APPROVE" {
+	if !canMergeOnApprove(cfg, result.verdict) {
 		return false, nil
 	}
 	if err := mergeAndClose(env.ctx, ghCtx.client, ghCtx.owner, ghCtx.repo, ghCtx.prNum, env.repoRoot, result.hash, cfg.mergeStrategy, cfg.deleteBranch, env.log); err != nil {

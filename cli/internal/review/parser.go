@@ -53,15 +53,29 @@ func truncate(s string, n int) string {
 }
 
 func parseConfidence(val string) string {
-	val = strings.TrimSpace(val)
+	val = strings.ToUpper(strings.TrimSpace(val))
 	switch {
 	case strings.HasPrefix(val, "HIGH"):
 		return "HIGH"
 	case strings.HasPrefix(val, "MEDIUM"):
 		return "MEDIUM"
-	default:
+	case strings.HasPrefix(val, "LOW"):
 		return "LOW"
+	default:
+		// Unrecognised or empty — treat as MEDIUM (same as meetsConfidence backward-compat rule).
+		return "MEDIUM"
 	}
+}
+
+// MeetsConfidence reports whether findingConf satisfies the minimum required level.
+// Empty confidence is treated as MEDIUM for backward compatibility with old issues.
+func MeetsConfidence(findingConf, minConf string) bool {
+	rank := map[string]int{"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+	fc := findingConf
+	if fc == "" {
+		fc = "MEDIUM"
+	}
+	return rank[fc] >= rank[strings.ToUpper(minConf)]
 }
 
 // ParseFindings extracts structured findings from a review response.
