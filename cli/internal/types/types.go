@@ -22,6 +22,13 @@ func AllowedMergeStrategies() string {
 	return strings.Join(allowedMergeStrategies, ", ")
 }
 
+// IssueSummary is a lightweight view of an open GitHub issue used to inform
+// the review model of already-tracked findings so it does not re-report them.
+type IssueSummary struct {
+	Number int
+	Title  string
+}
+
 // ModelInfo holds provider and model identity returned by the opencode API.
 type ModelInfo struct {
 	ProviderID   string

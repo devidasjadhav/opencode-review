@@ -130,6 +130,18 @@ func RevertHead(repoRoot string) error {
 	return nil
 }
 
+// DiffChangedFiles returns repo-relative paths of files modified in the given commit ref.
+func DiffChangedFiles(root, ref string) ([]string, error) {
+	out, err := Run(root, "diff-tree", "--no-commit-id", "-r", "--name-only", ref)
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
 func FixerStagePaths(before, after map[string]StatusSnapshotEntry) []string {
 	var paths []string
 	for path, afterStatus := range after {

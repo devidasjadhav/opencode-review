@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/talk/opencode-client/internal/git"
+	gh "github.com/talk/opencode-client/internal/github"
 	"github.com/talk/opencode-client/internal/logger"
 	occ "github.com/talk/opencode-client/internal/opencode"
 	"github.com/talk/opencode-client/internal/review"
@@ -93,7 +94,7 @@ func (r *loopRunner) Run() error {
 type reviewStep struct{}
 
 func (reviewStep) Run(state *loopState) (bool, error) {
-	result, err := runReviewIteration(state.env, state.selected, state.cfg, state.iteration, state.changedFiles)
+	result, err := runReviewIteration(state.env, state.ghCtx, state.selected, state.cfg, state.iteration, state.changedFiles)
 	if err != nil {
 		return false, err
 	}
@@ -234,7 +235,7 @@ func (waitStep) Run(state *loopState) (bool, error) {
 	return true, nil
 }
 
-func runReviewIteration(env runEnvironment, selected types.ModelInfo, cfg runConfig, iteration int, changedFiles map[string]bool) (iterationResult, error) {
+func runReviewIteration(env runEnvironment, ghCtx githubContext, selected types.ModelInfo, cfg runConfig, iteration int, changedFiles map[string]bool) (iterationResult, error) {
 	ref := cfg.commitRef
 	if cfg.loopMode && iteration > 1 {
 		ref = "HEAD"
@@ -255,7 +256,8 @@ func runReviewIteration(env runEnvironment, selected types.ModelInfo, cfg runCon
 			return iterationResult{}, wrapErr("Audit prompt error", err)
 		}
 	} else {
-		prompt = review.BuildReviewPrompt(hash, subject, body, diff)
+		rctx := buildReviewContext(env, ghCtx, cfg, hash)
+		prompt = review.BuildReviewPrompt(hash, subject, body, diff, rctx)
 	}
 	reviewText, err := occ.RunReview(env.client, env.ctx, env.repoRoot, selected, prompt)
 	if err != nil {
@@ -268,6 +270,39 @@ func runReviewIteration(env runEnvironment, selected types.ModelInfo, cfg runCon
 		reviewText: reviewText,
 		verdict:    review.ExtractVerdict(reviewText),
 	}, nil
+}
+
+// buildReviewContext gathers full file contents and existing issues to enrich
+// the review prompt. Failures are non-fatal — missing context degrades gracefully.
+func buildReviewContext(env runEnvironment, ghCtx githubContext, cfg runConfig, hash string) review.ReviewContext {
+	var rctx review.ReviewContext
+
+	// Embed full content of every file touched by this commit.
+	if files, err := git.DiffChangedFiles(env.repoRoot, hash); err == nil && len(files) > 0 {
+		rctx.ChangedFiles = readFileContents(env.repoRoot, files)
+	}
+
+	// Tell the model which issues are already tracked so it doesn't re-report them.
+	if ghCtx.client != nil {
+		if summaries, err := gh.ListOpenIssueSummaries(env.ctx, ghCtx.client, ghCtx.owner, ghCtx.repo); err == nil {
+			rctx.ExistingIssues = summaries
+		}
+	}
+
+	return rctx
+}
+
+// readFileContents reads the current on-disk content of each repo-relative path.
+func readFileContents(repoRoot string, relPaths []string) map[string]string {
+	m := make(map[string]string, len(relPaths))
+	for _, p := range relPaths {
+		data, err := os.ReadFile(filepath.Join(repoRoot, p))
+		if err != nil {
+			continue
+		}
+		m[p] = string(data)
+	}
+	return m
 }
 
 func runAutoFixIfNeeded(env runEnvironment, selected types.ModelInfo, cfg runConfig, reviewText string, iteration int) (bool, []string, error) {

@@ -101,6 +101,20 @@ func ExistingIssueTitles(ctx context.Context, gh *gogithub.Client, owner, repo s
 	return seen, nil
 }
 
+// ListOpenIssueSummaries returns lightweight summaries of all open non-PR issues.
+// Used to populate ReviewContext so the model knows what is already tracked.
+func ListOpenIssueSummaries(ctx context.Context, gh *gogithub.Client, owner, repo string) ([]types.IssueSummary, error) {
+	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	summaries := make([]types.IssueSummary, 0, len(issues))
+	for _, i := range issues {
+		summaries = append(summaries, types.IssueSummary{Number: i.GetNumber(), Title: i.GetTitle()})
+	}
+	return summaries, nil
+}
+
 // FindingIssueTitle returns the canonical GitHub issue title for a finding.
 func FindingIssueTitle(f types.Finding) string {
 	return fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)

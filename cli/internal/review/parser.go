@@ -3,6 +3,8 @@ package review
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -76,6 +78,78 @@ func MeetsConfidence(findingConf, minConf string) bool {
 		fc = "MEDIUM"
 	}
 	return rank[fc] >= rank[strings.ToUpper(minConf)]
+}
+
+// looksLikeItHasFindings returns true when the text appears to contain findings
+// but the strict parser produced none — signals a format deviation worth retrying.
+func looksLikeItHasFindings(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "high") ||
+		strings.Contains(lower, "medium") ||
+		strings.Contains(lower, "critical") ||
+		strings.Contains(lower, "finding")
+}
+
+// lenientFindingHeader accepts looser formatting variations:
+//   - ## or ### headers
+//   - severity with or without backticks/emoji
+//   - en-dash or em-dash separators
+var lenientFindingHeader = regexp.MustCompile(
+	`(?i)#{2,3}\s+` + "`?" + `\[?([^\]` + "`" + `]+(?:critical|high|medium|low)[^\]` + "`" + `]*)\]?` + "`?" +
+		`\s+(\S+?)(?::(\S*))?(?:\s+[—–-]+\s+(.+))?`,
+)
+
+// parseLenient is a best-effort fallback parser for when the strict parser
+// produces no findings but the text appears to contain some.
+func parseLenient(reviewText string) []types.Finding {
+	var findings []types.Finding
+	var current *types.Finding
+	var descLines []string
+
+	flush := func() {
+		if current == nil {
+			return
+		}
+		current.Description = strings.TrimSpace(strings.Join(descLines, "\n"))
+		current.Fingerprint = computeFingerprint(current.File, current.Title, current.Description)
+		findings = append(findings, *current)
+		current = nil
+		descLines = nil
+	}
+
+	inFindings := false
+	for _, line := range strings.Split(reviewText, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## Findings") {
+			inFindings = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, "## ") && inFindings {
+			break
+		}
+		if !inFindings {
+			continue
+		}
+		if m := lenientFindingHeader.FindStringSubmatch(trimmed); m != nil {
+			flush()
+			title := strings.TrimSpace(m[4])
+			if title == "" {
+				title = "Untitled finding"
+			}
+			current = &types.Finding{
+				Severity:  normalizeSeverity(m[1]),
+				File:      m[2],
+				LineRange: m[3],
+				Title:     title,
+			}
+			continue
+		}
+		if current != nil && trimmed != "" {
+			descLines = append(descLines, line)
+		}
+	}
+	flush()
+	return findings
 }
 
 // ParseFindings extracts structured findings from a review response.
@@ -156,6 +230,17 @@ func ParseFindings(reviewText string) []types.Finding {
 		}
 	}
 	flush()
+
+	// Fallback: if strict parsing yielded nothing but the text looks like it has
+	// findings, try the lenient parser and warn so the format deviation is visible.
+	if len(findings) == 0 && looksLikeItHasFindings(reviewText) {
+		fmt.Fprintf(os.Stderr, "Warning: strict finding parser found 0 results — trying lenient parser\n")
+		findings = parseLenient(reviewText)
+		if len(findings) > 0 {
+			fmt.Fprintf(os.Stderr, "  Lenient parser recovered %d finding(s). Consider fixing the model output format.\n", len(findings))
+		}
+	}
+
 	return findings
 }
 

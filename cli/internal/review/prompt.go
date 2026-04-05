@@ -5,8 +5,23 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"github.com/talk/opencode-client/internal/types"
 )
+
+// ReviewContext carries enriched context gathered before building a review prompt.
+// All fields are optional; absent fields are silently omitted from the prompt.
+type ReviewContext struct {
+	// ChangedFiles maps repo-relative paths to their full current content.
+	// Embedding whole files (not just diff hunks) lets the model understand
+	// surrounding code, types, and imports without guessing.
+	ChangedFiles map[string]string
+	// ExistingIssues lists open GitHub issues already tracking findings.
+	// The model is instructed not to re-report these.
+	ExistingIssues []types.IssueSummary
+}
 
 func findingsFormat(sb *strings.Builder) {
 	sb.WriteString("For each finding use EXACTLY this format:\n\n")
@@ -55,10 +70,13 @@ func ExtractVerifyVerdict(text string) string {
 }
 
 // BuildReviewPrompt builds a commit review prompt with SOLID/DRY checks.
-func BuildReviewPrompt(hash, subject, body, diff string) string {
+// rctx enriches the prompt with full file contents and existing issues so the
+// model has real context rather than only the diff.
+func BuildReviewPrompt(hash, subject, body, diff string, rctx ReviewContext) string {
 	var sb strings.Builder
-	sb.WriteString("Review the following git commit using the FULL project context and LSP info.\n")
-	sb.WriteString("Read all referenced files, trace types, follow imports — do not limit analysis to the diff alone.\n\n")
+	sb.WriteString("Review the following git commit for correctness, SOLID, and DRY violations.\n")
+	sb.WriteString("The full current content of every changed file is provided below the diff.\n")
+	sb.WriteString("Use those file contents — not just the diff hunks — to understand types, imports, and call sites.\n\n")
 	sb.WriteString("Respond ONLY with this exact structure (no prose outside it):\n\n")
 
 	sb.WriteString("## Summary\n")
@@ -68,7 +86,7 @@ func BuildReviewPrompt(hash, subject, body, diff string) string {
 	sb.WriteString("Per-file bullet list: `file` — what changed and the intent.\n\n")
 
 	sb.WriteString("## Findings\n")
-	sb.WriteString("Report real, verifiable issues including SOLID and DRY violations. Check for:\n")
+	sb.WriteString("Report real, verifiable issues. Check for:\n")
 	sb.WriteString("- **S** Single Responsibility: functions/types doing more than one job\n")
 	sb.WriteString("- **O** Open/Closed: logic that must be edited (not extended) to add behaviour\n")
 	sb.WriteString("- **L** Liskov: interface implementations that break caller assumptions\n")
@@ -83,14 +101,42 @@ func BuildReviewPrompt(hash, subject, body, diff string) string {
 	sb.WriteString("`REQUEST CHANGES` — must fix before merge.\n")
 	sb.WriteString("`COMMENT` — observations only.\n\n")
 
+	// Commit metadata + diff
 	sb.WriteString("---\n")
 	fmt.Fprintf(&sb, "Commit: %s\n", hash)
 	fmt.Fprintf(&sb, "Subject: %s\n", subject)
 	if body != "" {
 		fmt.Fprintf(&sb, "Body:\n%s\n", body)
 	}
-	sb.WriteString("\n---\n")
+	sb.WriteString("\n## Diff\n```diff\n")
 	sb.WriteString(diff)
+	sb.WriteString("\n```\n")
+
+	// Full file contents — the key context enrichment
+	if len(rctx.ChangedFiles) > 0 {
+		sb.WriteString("\n## Current File Contents\n")
+		sb.WriteString("These are the complete current versions of each changed file.\n\n")
+		// Sort for deterministic output
+		paths := make([]string, 0, len(rctx.ChangedFiles))
+		for p := range rctx.ChangedFiles {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		for _, p := range paths {
+			fmt.Fprintf(&sb, "### %s\n```\n%s\n```\n\n", p, rctx.ChangedFiles[p])
+		}
+	}
+
+	// Existing issues — prevents re-reporting already tracked findings
+	if len(rctx.ExistingIssues) > 0 {
+		sb.WriteString("## Already Tracked Issues — Do NOT Re-Report\n")
+		sb.WriteString("These findings are already filed as GitHub issues. Do not include them in your Findings section.\n\n")
+		for _, iss := range rctx.ExistingIssues {
+			fmt.Fprintf(&sb, "- #%d %s\n", iss.Number, iss.Title)
+		}
+		sb.WriteString("\n")
+	}
+
 	return sb.String()
 }
 
