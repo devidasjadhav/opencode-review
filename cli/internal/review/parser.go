@@ -93,10 +93,10 @@ func looksLikeItHasFindings(text string) bool {
 // lenientFindingHeader accepts looser formatting variations:
 //   - ## or ### headers
 //   - severity with or without backticks/emoji
-//   - en-dash or em-dash separators
+//   - en-dash, em-dash, or plain dash separator
+//   - file and optional :linerange as separate groups
 var lenientFindingHeader = regexp.MustCompile(
-	`(?i)#{2,3}\s+` + "`?" + `\[?([^\]` + "`" + `]+(?:critical|high|medium|low)[^\]` + "`" + `]*)\]?` + "`?" +
-		`\s+(\S+?)(?::(\S*))?(?:\s+[—–-]+\s+(.+))?`,
+	`(?i)#{2,3}\s+\[?(.*?(?:critical|high|medium|low).*?)\]?\s+([^:\s]+)(?::(\S+))?(?:\s+[-—–]+\s+(.+))?`,
 )
 
 // parseLenient is a best-effort fallback parser for when the strict parser
@@ -124,12 +124,11 @@ func parseLenient(reviewText string) []types.Finding {
 			inFindings = true
 			continue
 		}
-		if strings.HasPrefix(trimmed, "## ") && inFindings {
-			break
-		}
 		if !inFindings {
 			continue
 		}
+		// Check finding header BEFORE section-break so "## [High] file — title"
+		// is recognised as a finding, not a new section.
 		if m := lenientFindingHeader.FindStringSubmatch(trimmed); m != nil {
 			flush()
 			title := strings.TrimSpace(m[4])
@@ -143,6 +142,10 @@ func parseLenient(reviewText string) []types.Finding {
 				Title:     title,
 			}
 			continue
+		}
+		// Non-finding ## heading ends the Findings section.
+		if strings.HasPrefix(trimmed, "## ") {
+			break
 		}
 		if current != nil && trimmed != "" {
 			descLines = append(descLines, line)
