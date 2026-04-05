@@ -29,6 +29,7 @@ type runConfig struct {
 	validateIssues bool
 	minConfidence    string
 	verifierModelNum int
+	dryRun           bool
 }
 
 func (c runConfig) needsGitHubClient() bool {
@@ -66,8 +67,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	runIssueValidation(env.ctx, cfg.validateIssues, ghCtx.client, ghCtx.owner, ghCtx.repo, env.repoRoot, validateIssuesFn)
-	if cfg.validateIssues && ghCtx.client != nil {
+	runIssueValidation(env.ctx, cfg.validateIssues, ghCtx.gh, env.repoRoot)
+	if cfg.validateIssues && ghCtx.gh != nil {
 		fmt.Println()
 	}
 	selected, err := selectModel(env, cfg)
@@ -103,6 +104,7 @@ func parseFlags() runConfig {
 	validateIssues := flag.Bool("validate-issues", envBool(env, "VALIDATE_ISSUES", false), "Check open issues against current code and close stale ones before fixing")
 	minConfidence := flag.String("min-confidence", envOr(env, "MIN_CONFIDENCE", "MEDIUM"), "Minimum confidence level to auto-fix: HIGH, MEDIUM, or LOW")
 	verifierModelNum := flag.Int("verifier-model", envInt(env, "VERIFIER_MODEL", 0), "Model number to use as independent fix verifier (0 = disabled)")
+	dryRun := flag.Bool("dry-run", envBool(env, "DRY_RUN", false), "Print GitHub actions without executing them (no issues, no PR posts, no merges)")
 	flag.Parse()
 
 	return runConfig{
@@ -124,6 +126,7 @@ func parseFlags() runConfig {
 		validateIssues: *validateIssues,
 		minConfidence:    *minConfidence,
 		verifierModelNum: *verifierModelNum,
+		dryRun:           *dryRun,
 	}
 }
 

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"os"
 
-	gogithub "github.com/google/go-github/v67/github"
-
 	"github.com/talk/opencode-client/internal/git"
 	gh "github.com/talk/opencode-client/internal/github"
 	"github.com/talk/opencode-client/internal/logger"
@@ -16,28 +14,36 @@ import (
 )
 
 type githubContext struct {
-	client *gogithub.Client
-	owner  string
-	repo   string
-	prNum  int
+	gh    gh.Port // nil when no GitHub integration is needed
+	owner string  // retained for display ("owner/repo PR #N")
+	repo  string
+	prNum int
 }
 
 func initGitHubContext(env runEnvironment, cfg runConfig) (githubContext, error) {
 	if !cfg.needsGitHubClient() {
 		return githubContext{}, nil
 	}
-	ghClient, err := gh.NewClient(env.ctx)
-	if err != nil {
-		return githubContext{}, wrapErr("GitHub", err)
-	}
-	ghOwner, ghRepo, err := gh.RepoOwnerName(env.repoRoot)
+
+	owner, repo, err := gh.RepoOwnerName(env.repoRoot)
 	if err != nil {
 		return githubContext{}, wrapErr("GitHub", err)
 	}
 
-	ghCtx := githubContext{client: ghClient, owner: ghOwner, repo: ghRepo}
+	var port gh.Port
+	if cfg.dryRun {
+		port = gh.NoOpClient{}
+	} else {
+		rc, err := gh.NewRealClient(env.ctx, owner, repo)
+		if err != nil {
+			return githubContext{}, wrapErr("GitHub", err)
+		}
+		port = rc
+	}
+
+	ghCtx := githubContext{gh: port, owner: owner, repo: repo}
 	if cfg.needsPRContext() {
-		ghCtx.prNum, err = ensurePRWithOutput(env.ctx, ghClient, ghOwner, ghRepo, env.repoRoot, cfg.baseBranch, cfg.requiresPRSetup())
+		ghCtx.prNum, err = ensurePRWithOutput(env.ctx, port, owner, repo, env.repoRoot, cfg.baseBranch, cfg.requiresPRSetup())
 		if err != nil {
 			return githubContext{}, err
 		}
@@ -45,8 +51,8 @@ func initGitHubContext(env runEnvironment, cfg runConfig) (githubContext, error)
 	return ghCtx, nil
 }
 
-func ensurePRWithOutput(ctx context.Context, ghClient *gogithub.Client, owner, repo, repoRoot, baseBranch string, required bool) (int, error) {
-	prNum, created, err := gh.EnsureOpenPR(ctx, ghClient, owner, repo, repoRoot, baseBranch)
+func ensurePRWithOutput(ctx context.Context, port gh.Port, owner, repo, repoRoot, baseBranch string, required bool) (int, error) {
+	prNum, created, err := port.EnsureOpenPR(ctx, repoRoot, baseBranch)
 	if err != nil {
 		if required {
 			return 0, wrapErr("GitHub PR", err)
@@ -62,24 +68,18 @@ func ensurePRWithOutput(ctx context.Context, ghClient *gogithub.Client, owner, r
 	return prNum, nil
 }
 
-// validateIssuesFn is the default implementation passed to runIssueValidation.
-var validateIssuesFn = gh.ValidateIssues
-
-func runIssueValidation(ctx context.Context, validate bool, ghClient *gogithub.Client,
-	owner, repo, repoRoot string,
-	validateFn func(context.Context, *gogithub.Client, string, string, string) ([]gh.IssueValidity, error)) {
-
-	if !validate || ghClient == nil {
+func runIssueValidation(ctx context.Context, validate bool, port gh.Port, repoRoot string) {
+	if !validate || port == nil {
 		return
 	}
 	fmt.Println("Validating open issues against current codebase...")
-	validations, err := validateFn(ctx, ghClient, owner, repo, repoRoot)
+	validations, err := port.ValidateIssues(ctx, repoRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: issue validation failed: %v\n", err)
 		return
 	}
 	printIssueValidation(validations)
-	reconcileStaleIssues(ctx, ghClient, owner, repo, validations)
+	reconcileStaleIssues(ctx, port, validations)
 }
 
 func printIssueValidation(validations []gh.IssueValidity) {
@@ -92,12 +92,12 @@ func printIssueValidation(validations []gh.IssueValidity) {
 	}
 }
 
-func reconcileStaleIssues(ctx context.Context, ghClient *gogithub.Client, owner, repo string, validations []gh.IssueValidity) {
+func reconcileStaleIssues(ctx context.Context, port gh.Port, validations []gh.IssueValidity) {
 	for _, v := range validations {
 		if v.Valid {
 			continue
 		}
-		_ = closeIssueWithReporting(ctx, ghClient, owner, repo, v.Number, issueCloseOptions{
+		_ = closeIssueWithReporting(ctx, port, v.Number, issueCloseOptions{
 			preCloseComment: fmt.Sprintf("Closing as stale: %s", v.Reason),
 			onCommentError: func(issueNum int, err error) {
 				fmt.Fprintf(os.Stderr, "  Warning: failed to comment on #%d: %v\n", issueNum, err)
@@ -114,7 +114,7 @@ func postPRReviewIfRequested(ctx context.Context, ghCtx githubContext, cfg runCo
 		return
 	}
 	fmt.Printf("Posting PR review (%s)...\n", verdict)
-	if err := gh.PostPRReview(ctx, ghCtx.client, ghCtx.owner, ghCtx.repo, ghCtx.prNum, reviewText, verdict); err != nil {
+	if err := ghCtx.gh.PostPRReview(ctx, ghCtx.prNum, reviewText, verdict); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to post PR review: %v\n", err)
 		return
 	}
@@ -129,42 +129,46 @@ func maybeMergeOnApprove(env runEnvironment, ghCtx githubContext, cfg runConfig,
 	if !canMergeOnApprove(cfg, result.verdict) {
 		return false, nil
 	}
-	if err := mergeAndClose(env.ctx, ghCtx.client, ghCtx.owner, ghCtx.repo, ghCtx.prNum, env.repoRoot, result.hash, cfg.mergeStrategy, cfg.deleteBranch, env.log); err != nil {
+	if err := mergeAndClose(env.ctx, ghCtx.gh, ghCtx.prNum, env.repoRoot, result.hash, cfg.mergeStrategy, cfg.deleteBranch, env.log); err != nil {
 		return false, wrapErr("Failed to merge", err)
 	}
 	if cfg.createIssues {
-		if err := closeRunIssues(env.ctx, ghCtx.client, ghCtx.owner, ghCtx.repo, openIssues, env.log); err != nil {
+		if err := closeRunIssues(env.ctx, ghCtx.gh, openIssues, env.log); err != nil {
 			return false, wrapErr("Failed to close issues", err)
 		}
 	}
 	return true, nil
 }
 
-func fileIssues(ctx context.Context, ghClient *gogithub.Client, owner, repo string, prNum int,
+func fileIssues(ctx context.Context, port gh.Port, prNum int,
 	reviewText string, openIssues []int, log *logger.Logger) ([]int, error) {
 
 	findings := review.ParseFindings(reviewText)
-	seen, err := gh.ExistingIssueTitles(ctx, ghClient, owner, repo)
+	seen, err := port.ExistingIssueTitles(ctx)
 	if err != nil {
 		return openIssues, wrapErr("failed to list existing issues", err)
 	}
-	newIssues, updatedOpen, err := createIssuesForFindings(ctx, ghClient, owner, repo, prNum, findings, seen, openIssues, log)
+	fingerprints, err := port.ExistingFingerprints(ctx)
+	if err != nil {
+		return openIssues, wrapErr("failed to list existing fingerprints", err)
+	}
+	newIssues, updatedOpen, err := createIssuesForFindings(ctx, port, prNum, findings, seen, fingerprints, openIssues, log)
 	if err != nil {
 		return openIssues, err
 	}
 	emitIssueSummary(findings, newIssues)
-	if err := linkIssuesIfNeeded(ctx, ghClient, owner, repo, prNum, newIssues); err != nil {
+	if err := linkIssuesIfNeeded(ctx, port, prNum, newIssues); err != nil {
 		fmt.Fprintf(os.Stderr, "  Failed to link issues to PR: %v\n", err)
 	}
 	return updatedOpen, nil
 }
 
-func createIssuesForFindings(ctx context.Context, ghClient *gogithub.Client, owner, repo string, prNum int,
-	findings []types.Finding, seen map[string]bool, openIssues []int, log *logger.Logger) ([]int, []int, error) {
+func createIssuesForFindings(ctx context.Context, port gh.Port, prNum int,
+	findings []types.Finding, seen map[string]bool, fingerprints map[string]int, openIssues []int, log *logger.Logger) ([]int, []int, error) {
 	var newIssues []int
 	updatedOpen := openIssues
 	for _, f := range findings {
-		num, created, err := createIssueForFinding(ctx, ghClient, owner, repo, f, seen)
+		num, created, err := createIssueForFinding(ctx, port, f, seen, fingerprints)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  Failed to create issue for %q: %v\n", f.Title, err)
 			continue
@@ -175,19 +179,24 @@ func createIssuesForFindings(ctx context.Context, ghClient *gogithub.Client, own
 		emitIssueCreated(log, f, num)
 		newIssues = append(newIssues, num)
 		updatedOpen = append(updatedOpen, num)
-		commentIssueWithPRIfNeeded(ctx, ghClient, owner, repo, prNum, num)
+		commentIssueWithPRIfNeeded(ctx, port, prNum, num)
 	}
 	return newIssues, updatedOpen, nil
 }
 
-func createIssueForFinding(ctx context.Context, ghClient *gogithub.Client, owner, repo string,
-	f types.Finding, seen map[string]bool) (int, bool, error) {
+func createIssueForFinding(ctx context.Context, port gh.Port,
+	f types.Finding, seen map[string]bool, fingerprints map[string]int) (int, bool, error) {
 	ghTitle := gh.FindingIssueTitle(f)
+	// Fingerprint check first (more robust), title as fallback.
+	if fingerprints[f.Fingerprint] != 0 {
+		fmt.Printf("  Skipping (fingerprint match #%d): %s\n", fingerprints[f.Fingerprint], ghTitle)
+		return 0, false, nil
+	}
 	if seen[ghTitle] {
 		fmt.Printf("  Skipping (already open): %s\n", ghTitle)
 		return 0, false, nil
 	}
-	num, err := gh.CreateIssue(ctx, ghClient, owner, repo, f)
+	num, err := port.CreateIssue(ctx, f)
 	if err != nil {
 		return 0, false, err
 	}
@@ -195,12 +204,12 @@ func createIssueForFinding(ctx context.Context, ghClient *gogithub.Client, owner
 	return num, true, nil
 }
 
-func commentIssueWithPRIfNeeded(ctx context.Context, ghClient *gogithub.Client, owner, repo string, prNum, issueNum int) {
+func commentIssueWithPRIfNeeded(ctx context.Context, port gh.Port, prNum, issueNum int) {
 	if prNum <= 0 {
 		return
 	}
 	prRef := fmt.Sprintf("Tracking in PR #%d.", prNum)
-	if err := gh.CommentOnIssue(ctx, ghClient, owner, repo, issueNum, prRef); err != nil {
+	if err := port.CommentOnIssue(ctx, issueNum, prRef); err != nil {
 		fmt.Fprintf(os.Stderr, "  Warning: could not comment on issue #%d: %v\n", issueNum, err)
 	}
 }
@@ -223,24 +232,24 @@ func emitIssueSummary(findings []types.Finding, newIssues []int) {
 	}
 }
 
-func linkIssuesIfNeeded(ctx context.Context, ghClient *gogithub.Client, owner, repo string, prNum int, newIssues []int) error {
+func linkIssuesIfNeeded(ctx context.Context, port gh.Port, prNum int, newIssues []int) error {
 	if prNum <= 0 || len(newIssues) == 0 {
 		return nil
 	}
-	if err := gh.LinkIssuesToPR(ctx, ghClient, owner, repo, prNum, newIssues); err != nil {
+	if err := port.LinkIssuesToPR(ctx, prNum, newIssues); err != nil {
 		return err
 	}
 	fmt.Println("  Issues linked to PR.")
 	return nil
 }
 
-func mergeAndClose(ctx context.Context, ghClient *gogithub.Client, owner, repo string, prNum int,
+func mergeAndClose(ctx context.Context, port gh.Port, prNum int,
 	repoRoot, hash, strategy string, deleteBranch bool, log *logger.Logger) error {
 	fmt.Println("\nAll issues resolved — merging PR...")
 	if err := verifyReviewedHead(repoRoot, hash); err != nil {
 		return err
 	}
-	if err := executePRMerge(ctx, ghClient, owner, repo, prNum, strategy, deleteBranch); err != nil {
+	if err := port.MergePR(ctx, prNum, strategy, deleteBranch); err != nil {
 		return err
 	}
 	fmt.Println("Merged.")
@@ -259,11 +268,7 @@ func verifyReviewedHead(repoRoot, hash string) error {
 	return nil
 }
 
-func executePRMerge(ctx context.Context, ghClient *gogithub.Client, owner, repo string, prNum int, strategy string, deleteBranch bool) error {
-	return gh.MergePR(ctx, ghClient, owner, repo, prNum, strategy, deleteBranch)
-}
-
-func closeRunIssues(ctx context.Context, ghClient *gogithub.Client, owner, repo string, openIssues []int, log *logger.Logger) error {
+func closeRunIssues(ctx context.Context, port gh.Port, openIssues []int, log *logger.Logger) error {
 	closeNums := map[int]bool{}
 	for _, n := range openIssues {
 		closeNums[n] = true
@@ -273,7 +278,7 @@ func closeRunIssues(ctx context.Context, ghClient *gogithub.Client, owner, repo 
 	if len(closeNums) > 0 {
 		fmt.Printf("Closing %d opencode-review issue(s)...\n", len(closeNums))
 		for n := range closeNums {
-			closeErr = errors.Join(closeErr, closeIssueWithReporting(ctx, ghClient, owner, repo, n, issueCloseOptions{
+			closeErr = errors.Join(closeErr, closeIssueWithReporting(ctx, port, n, issueCloseOptions{
 				onCloseError: func(issueNum int, err error) {
 					fmt.Fprintf(os.Stderr, "  Failed to close #%d: %v\n", issueNum, err)
 				},
@@ -298,13 +303,13 @@ type issueCloseOptions struct {
 	onClosed        func(issueNum int)
 }
 
-func closeIssueWithReporting(ctx context.Context, ghClient *gogithub.Client, owner, repo string, issueNum int, opts issueCloseOptions) error {
+func closeIssueWithReporting(ctx context.Context, port gh.Port, issueNum int, opts issueCloseOptions) error {
 	if opts.preCloseComment != "" {
-		if err := gh.CommentOnIssue(ctx, ghClient, owner, repo, issueNum, opts.preCloseComment); err != nil && opts.onCommentError != nil {
+		if err := port.CommentOnIssue(ctx, issueNum, opts.preCloseComment); err != nil && opts.onCommentError != nil {
 			opts.onCommentError(issueNum, err)
 		}
 	}
-	if err := gh.CloseIssue(ctx, ghClient, owner, repo, issueNum); err != nil {
+	if err := port.CloseIssue(ctx, issueNum); err != nil {
 		if opts.onCloseError != nil {
 			opts.onCloseError(issueNum, err)
 		}

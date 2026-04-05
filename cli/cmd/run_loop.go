@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/talk/opencode-client/internal/git"
-	gh "github.com/talk/opencode-client/internal/github"
 	"github.com/talk/opencode-client/internal/logger"
 	occ "github.com/talk/opencode-client/internal/opencode"
 	"github.com/talk/opencode-client/internal/review"
@@ -122,7 +121,7 @@ func (issueStep) Run(state *loopState) (bool, error) {
 	if !state.cfg.createIssues || state.result.reviewText == "" {
 		return false, nil
 	}
-	openIssues, err := fileIssues(state.env.ctx, state.ghCtx.client, state.ghCtx.owner, state.ghCtx.repo, state.ghCtx.prNum, state.result.reviewText, state.openIssues, state.env.log)
+	openIssues, err := fileIssues(state.env.ctx, state.ghCtx.gh, state.ghCtx.prNum, state.result.reviewText, state.openIssues, state.env.log)
 	if err != nil {
 		return false, err
 	}
@@ -283,8 +282,8 @@ func buildReviewContext(env runEnvironment, ghCtx githubContext, cfg runConfig, 
 	}
 
 	// Tell the model which issues are already tracked so it doesn't re-report them.
-	if ghCtx.client != nil {
-		if summaries, err := gh.ListOpenIssueSummaries(env.ctx, ghCtx.client, ghCtx.owner, ghCtx.repo); err == nil {
+	if ghCtx.gh != nil {
+		if summaries, err := ghCtx.gh.ListOpenIssueSummaries(env.ctx); err == nil {
 			rctx.ExistingIssues = summaries
 		}
 	}
