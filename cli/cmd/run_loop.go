@@ -47,6 +47,8 @@ type loopState struct {
 	iteration    int
 	result       iterationResult
 	openIssues   []int
+	// changedFiles is written by autoFixStep and read by reviewStep.
+	// Steps execute sequentially in a single goroutine — no synchronisation needed.
 	changedFiles map[string]bool
 	lastFixPaths []string
 	stop         bool

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	sdk "github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
@@ -91,10 +92,14 @@ func streamSession(client *sdk.Client, ctx context.Context, repoRoot string, sel
 	}
 	sessionID := session.ID
 	defer func() {
-		client.Session.Delete(ctx, sessionID, sdk.SessionDeleteParams{}) //nolint
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		client.Session.Delete(cleanupCtx, sessionID, sdk.SessionDeleteParams{}) //nolint
 	}()
 
-	idleCh := make(chan string, 2)
+	// Buffer of 3 ensures consumeSessionEvents never blocks on send:
+	// idle event + stream-error fallback + edge-case rapid session-error then stream-close.
+	idleCh := make(chan string, 3)
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream := client.Event.ListStreaming(streamCtx, sdk.EventListParams{
@@ -346,7 +351,10 @@ func stageCommitPushFixes(repoRoot string, findings []types.Finding, iteration i
 	if _, err := git.Run(repoRoot, commitArgs...); err != nil {
 		return fixPersistResult{}, runFixError{Context: "  git commit failed", Err: err}
 	}
-	branch, _ := git.Run(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	branch, err := git.Run(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return fixPersistResult{}, runFixError{Context: "  git branch resolution failed", Err: err}
+	}
 	if _, err := git.Run(repoRoot, "push", "origin", branch); err != nil {
 		return fixPersistResult{}, runFixError{Context: "  git push failed", Err: err}
 	}
