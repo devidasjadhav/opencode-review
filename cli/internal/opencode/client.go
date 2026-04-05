@@ -80,10 +80,44 @@ func SelectModel(models []types.ModelInfo) (types.ModelInfo, error) {
 	}
 }
 
+const (
+	streamMaxAttempts = 3
+	streamBackoffBase = 5 * time.Second
+)
+
 // streamSession creates an opencode session, sends prompt, streams the response
 // and returns the full text when the session goes idle.
+// Retries up to streamMaxAttempts times with exponential backoff on transient
+// errors; does not retry if the caller context is cancelled.
 // renderer receives streamed text deltas when non-nil.
 func streamSession(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string, renderer io.Writer) (string, error) {
+	var lastErr error
+	backoff := streamBackoffBase
+	for attempt := 1; attempt <= streamMaxAttempts; attempt++ {
+		result, err := tryStreamSession(client, ctx, repoRoot, selected, prompt, renderer)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		// Don't retry if the caller cancelled the context.
+		if ctx.Err() != nil {
+			return "", err
+		}
+		if attempt < streamMaxAttempts {
+			fmt.Fprintf(os.Stderr, "  Session error (attempt %d/%d): %v — retrying in %s\n", attempt, streamMaxAttempts, err, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			backoff *= 2
+		}
+	}
+	return "", lastErr
+}
+
+// tryStreamSession is a single attempt at streaming a session.
+func tryStreamSession(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string, renderer io.Writer) (string, error) {
 	session, err := client.Session.New(ctx, sdk.SessionNewParams{
 		Directory: sdk.F(repoRoot),
 	})
@@ -213,7 +247,7 @@ func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected t
 	if persister == nil {
 		persister = NewGitFixPersister()
 	}
-	prompt := buildFixPrompt(findings)
+	prompt := buildFixPrompt(findings, repoRoot)
 	applyResult, err := applyFixPrompt(client, ctx, repoRoot, selected, prompt)
 	if err != nil {
 		return 0, nil, err
@@ -272,12 +306,32 @@ func (e runFixError) Error() string {
 	return fmt.Sprintf("%s: %v", e.Context, e.Err)
 }
 
-func buildFixPrompt(findings []types.Finding) string {
+// buildFixPrompt constructs the prompt sent to the AI fixer.
+// repoRoot is used to read the current on-disk content of each file
+// referenced in findings so the model works from accurate code, not
+// a potentially stale mental model built from the original review diff.
+func buildFixPrompt(findings []types.Finding, repoRoot string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "You are an automated code fixer. Apply ALL of the following fixes to the codebase.\n")
 	fmt.Fprintf(&sb, "Make minimal, targeted changes. Do not refactor unrelated code.\n")
 	fmt.Fprintf(&sb, "IMPORTANT: Only modify the specific file(s) referenced in each finding. Do NOT touch any other files.\n")
 	fmt.Fprintf(&sb, "After applying all fixes, stop — do not explain or summarise.\n\n")
+
+	// Embed current file contents so the fixer has the real code, not
+	// just the review diff which may be stale if other fixes ran first.
+	if contents := collectFixFileContents(repoRoot, findings); len(contents) > 0 {
+		sb.WriteString("## Current File Contents\n")
+		sb.WriteString("Use these as the authoritative source of truth when applying fixes.\n\n")
+		paths := make([]string, 0, len(contents))
+		for p := range contents {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		for _, p := range paths {
+			fmt.Fprintf(&sb, "### %s\n```\n%s\n```\n\n", p, contents[p])
+		}
+	}
+
 	for i, f := range findings {
 		if f.AgentPrompt == "" {
 			continue
@@ -292,6 +346,25 @@ func buildFixPrompt(findings []types.Finding) string {
 		}
 	}
 	return sb.String()
+}
+
+// collectFixFileContents reads the current on-disk content of every unique
+// file referenced in findings. Missing or unreadable files are silently skipped.
+func collectFixFileContents(repoRoot string, findings []types.Finding) map[string]string {
+	seen := make(map[string]bool)
+	contents := make(map[string]string)
+	for _, f := range findings {
+		if f.File == "" || seen[f.File] {
+			continue
+		}
+		seen[f.File] = true
+		data, err := os.ReadFile(filepath.Join(repoRoot, f.File))
+		if err != nil {
+			continue
+		}
+		contents[f.File] = string(data)
+	}
+	return contents
 }
 
 func applyFixPrompt(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string) (fixApplyResult, error) {
