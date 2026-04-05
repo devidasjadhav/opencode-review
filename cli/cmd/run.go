@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	occ "github.com/talk/opencode-client/internal/opencode"
 	"github.com/talk/opencode-client/internal/types"
 )
 
@@ -26,7 +27,8 @@ type runConfig struct {
 	baseBranch     string
 	createBranch   bool
 	validateIssues bool
-	minConfidence  string
+	minConfidence    string
+	verifierModelNum int
 }
 
 func (c runConfig) needsGitHubClient() bool {
@@ -72,7 +74,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	return executeReviewLoop(env, ghCtx, selected, cfg)
+	verifier, err := resolveVerifierModel(env, cfg)
+	if err != nil {
+		return err
+	}
+	return executeReviewLoop(env, ghCtx, selected, verifier, cfg)
 }
 
 func parseFlags() runConfig {
@@ -93,6 +99,7 @@ func parseFlags() runConfig {
 	createBranch := flag.Bool("create-branch", false, "Create a new fix branch from current HEAD and push before opening PR")
 	validateIssues := flag.Bool("validate-issues", false, "Check open issues against current code and close stale ones before fixing")
 	minConfidence := flag.String("min-confidence", "MEDIUM", "Minimum confidence level to auto-fix: HIGH, MEDIUM, or LOW")
+	verifierModelNum := flag.Int("verifier-model", 0, "Model number to use as independent fix verifier (0 = disabled)")
 	flag.Parse()
 
 	return runConfig{
@@ -112,8 +119,27 @@ func parseFlags() runConfig {
 		baseBranch:     *baseBranch,
 		createBranch:   *createBranch,
 		validateIssues: *validateIssues,
-		minConfidence:  *minConfidence,
+		minConfidence:    *minConfidence,
+		verifierModelNum: *verifierModelNum,
 	}
+}
+
+// resolveVerifierModel returns the ModelInfo for the verifier if --verifier-model
+// is set, or a zero-value ModelInfo (disabled) if not.
+func resolveVerifierModel(env runEnvironment, cfg runConfig) (types.ModelInfo, error) {
+	if cfg.verifierModelNum == 0 {
+		return types.ModelInfo{}, nil
+	}
+	models, err := occ.ListModels(env.client, env.ctx, env.repoRoot)
+	if err != nil {
+		return types.ModelInfo{}, fmt.Errorf("verifier model: %w", err)
+	}
+	if cfg.verifierModelNum < 1 || cfg.verifierModelNum > len(models) {
+		return types.ModelInfo{}, fmt.Errorf("verifier model: invalid number %d (have %d models)", cfg.verifierModelNum, len(models))
+	}
+	m := models[cfg.verifierModelNum-1]
+	fmt.Printf("Verifier: [%d] %s / %s\n\n", cfg.verifierModelNum, m.ProviderName, m.ModelName)
+	return m, nil
 }
 
 func normalizeLoopFlags(loopMode, mergeOnApprove, autoFix *bool, loopInterval *time.Duration) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/talk/opencode-client/internal/git"
@@ -20,13 +21,14 @@ type iterationResult struct {
 	verdict    string
 }
 
-func executeReviewLoop(env runEnvironment, ghCtx githubContext, selected types.ModelInfo, cfg runConfig) error {
-	runner := newLoopRunner(env, ghCtx, selected, cfg, []LoopStep{
+func executeReviewLoop(env runEnvironment, ghCtx githubContext, selected, verifier types.ModelInfo, cfg runConfig) error {
+	runner := newLoopRunner(env, ghCtx, selected, verifier, cfg, []LoopStep{
 		reviewStep{},
 		postReviewStep{},
 		issueStep{},
 		mergeStep{},
 		autoFixStep{},
+		verifyFixStep{},
 		waitStep{},
 	})
 	return runner.Run()
@@ -40,11 +42,13 @@ type loopState struct {
 	env          runEnvironment
 	ghCtx        githubContext
 	selected     types.ModelInfo
+	verifier     types.ModelInfo
 	cfg          runConfig
 	iteration    int
 	result       iterationResult
 	openIssues   []int
 	changedFiles map[string]bool
+	lastFixPaths []string
 	stop         bool
 }
 
@@ -53,9 +57,9 @@ type loopRunner struct {
 	steps []LoopStep
 }
 
-func newLoopRunner(env runEnvironment, ghCtx githubContext, selected types.ModelInfo, cfg runConfig, steps []LoopStep) *loopRunner {
+func newLoopRunner(env runEnvironment, ghCtx githubContext, selected, verifier types.ModelInfo, cfg runConfig, steps []LoopStep) *loopRunner {
 	return &loopRunner{
-		state: loopState{env: env, ghCtx: ghCtx, selected: selected, cfg: cfg},
+		state: loopState{env: env, ghCtx: ghCtx, selected: selected, verifier: verifier, cfg: cfg},
 		steps: steps,
 	}
 }
@@ -148,13 +152,13 @@ func (mergeStep) Run(state *loopState) (bool, error) {
 type autoFixStep struct{}
 
 func (autoFixStep) Run(state *loopState) (bool, error) {
+	state.lastFixPaths = nil
 	if !state.cfg.autoFix {
 		return false, nil
 	}
 	findings := review.ParseFindings(state.result.reviewText)
 	fixable := filterFixableFindings(findings, state.cfg.minConfidence)
-	hasFixable := len(fixable) > 0
-	if len(findings) > 0 && !hasFixable {
+	if len(findings) > 0 && len(fixable) == 0 {
 		fmt.Fprintln(os.Stderr, "\nAuto-fix: no fixable findings at required confidence — cannot auto-fix. Manual intervention required.")
 		state.stop = true
 		return false, nil
@@ -165,8 +169,53 @@ func (autoFixStep) Run(state *loopState) (bool, error) {
 	}
 	if len(changedPaths) > 0 {
 		state.changedFiles = pathsToRelMap(changedPaths, state.env.repoRoot)
+		state.lastFixPaths = changedPaths
 	}
 	return cont, nil
+}
+
+type verifyFixStep struct{}
+
+func (verifyFixStep) Run(state *loopState) (bool, error) {
+	if state.verifier.ModelID == "" || len(state.lastFixPaths) == 0 {
+		return false, nil
+	}
+	diff, err := git.DiffHead(state.env.repoRoot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nVerifier: could not get diff: %v — skipping verification\n", err)
+		return false, nil
+	}
+	findings := review.ParseFindings(state.result.reviewText)
+	fixable := filterFixableFindings(findings, state.cfg.minConfidence)
+	prompt := review.BuildVerifyPrompt(diff, buildFindingSummary(fixable))
+
+	fmt.Println("\n--- Independent Verification ---")
+	verifyText, err := occ.RunVerify(state.env.client, state.env.ctx, state.env.repoRoot, state.verifier, prompt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Verifier: session error: %v — treating as FAIL\n", err)
+		verifyText = "FAIL — verifier session error"
+	}
+
+	verdict := review.ExtractVerifyVerdict(verifyText)
+	logEvent(state.env.log, map[string]any{
+		"event":          "verify_fix",
+		"iteration":      state.iteration,
+		"verify_verdict": verdict,
+	})
+
+	if verdict == "PASS" {
+		fmt.Println("\nVerification: PASS — fix accepted.")
+		return false, nil
+	}
+
+	fmt.Fprintln(os.Stderr, "\nVerification: FAIL — reverting fix commit.")
+	if err := git.RevertHead(state.env.repoRoot); err != nil {
+		return false, fmt.Errorf("verifier: revert failed: %w", err)
+	}
+	logEvent(state.env.log, map[string]any{"event": "verify_fix_reverted", "iteration": state.iteration})
+	state.lastFixPaths = nil
+	state.changedFiles = nil
+	return true, nil
 }
 
 type waitStep struct{}
@@ -246,6 +295,17 @@ func filterFixableFindings(findings []types.Finding, minConfidence string) []typ
 		}
 	}
 	return fixable
+}
+
+func buildFindingSummary(findings []types.Finding) string {
+	var sb strings.Builder
+	for _, f := range findings {
+		fmt.Fprintf(&sb, "[%s] %s:%s — %s\n", f.Severity, f.File, f.LineRange, f.Title)
+		if f.Description != "" {
+			fmt.Fprintf(&sb, "  %s\n", strings.TrimSpace(f.Description))
+		}
+	}
+	return sb.String()
 }
 
 func pathsToRelMap(paths []string, repoRoot string) map[string]bool {

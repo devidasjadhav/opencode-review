@@ -19,6 +19,41 @@ func findingsFormat(sb *strings.Builder) {
 	sb.WriteString("If there are no issues: write `_No issues found._` and skip subsections.\n\n")
 }
 
+// BuildVerifyPrompt builds a short focused prompt asking a second model to
+// verify whether a fix diff correctly addresses the stated findings.
+func BuildVerifyPrompt(diff, findings string) string {
+	var sb strings.Builder
+	sb.WriteString("You are an independent code reviewer. A previous model applied automated fixes.\n")
+	sb.WriteString("Your job: verify whether those fixes are correct and complete.\n\n")
+	sb.WriteString("Respond with EXACTLY one of:\n\n")
+	sb.WriteString("  PASS — <one sentence: why the fix is correct>\n")
+	sb.WriteString("  FAIL — <one sentence: what is wrong or missing>\n\n")
+	sb.WriteString("Rules:\n")
+	sb.WriteString("- Output only the verdict line above. No prose, no headings, no lists.\n")
+	sb.WriteString("- PASS only if the fix fully addresses ALL findings below without introducing new defects.\n")
+	sb.WriteString("- FAIL if the fix is incomplete, incorrect, introduces a regression, or makes unrelated changes.\n\n")
+	sb.WriteString("--- Findings that were supposed to be fixed ---\n")
+	sb.WriteString(findings)
+	sb.WriteString("\n\n--- Fix diff (git show HEAD) ---\n")
+	sb.WriteString(diff)
+	return sb.String()
+}
+
+// ExtractVerifyVerdict parses PASS or FAIL from a verifier response.
+// Defaults to FAIL (fail-safe) if neither token is found.
+func ExtractVerifyVerdict(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(strings.ToUpper(line))
+		if strings.HasPrefix(line, "PASS") {
+			return "PASS"
+		}
+		if strings.HasPrefix(line, "FAIL") {
+			return "FAIL"
+		}
+	}
+	return "FAIL"
+}
+
 // BuildReviewPrompt builds a commit review prompt with SOLID/DRY checks.
 func BuildReviewPrompt(hash, subject, body, diff string) string {
 	var sb strings.Builder
