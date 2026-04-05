@@ -133,7 +133,7 @@ func tryStreamSession(client *sdk.Client, ctx context.Context, repoRoot string, 
 
 	// Buffer of 3 ensures consumeSessionEvents never blocks on send:
 	// idle event + stream-error fallback + edge-case rapid session-error then stream-close.
-	idleCh := make(chan string, 3)
+	idleCh := make(chan streamResult, 3)
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream := client.Event.ListStreaming(streamCtx, sdk.EventListParams{
@@ -159,10 +159,17 @@ func tryStreamSession(client *sdk.Client, ctx context.Context, repoRoot string, 
 		cancel()
 		return "", fmt.Errorf("error sending prompt: %w", err)
 	}
-	return <-idleCh, nil
+	res := <-idleCh
+	return res.text, res.err
 }
 
-func consumeSessionEvents(stream sessionEventStream, sessionID string, renderer io.Writer, idleCh chan<- string, cancel context.CancelFunc) {
+// streamResult carries the outcome of a streamed session to the caller goroutine.
+type streamResult struct {
+	text string
+	err  error
+}
+
+func consumeSessionEvents(stream sessionEventStream, sessionID string, renderer io.Writer, idleCh chan<- streamResult, cancel context.CancelFunc) {
 	defer cancel()
 	var buf strings.Builder
 	for stream.Next() {
@@ -176,16 +183,17 @@ func consumeSessionEvents(stream sessionEventStream, sessionID string, renderer 
 				if renderer != nil {
 					_, _ = io.WriteString(renderer, "\n\n")
 				}
-				idleCh <- buf.String()
+				idleCh <- streamResult{text: buf.String()}
 			}
 		case sdk.EventListResponseTypeSessionError:
-			fmt.Fprintf(os.Stderr, "\n[session error] %s\n", event.JSON.RawJSON())
-			idleCh <- ""
+			raw := event.JSON.RawJSON()
+			fmt.Fprintf(os.Stderr, "\n[session error] %s\n", raw)
+			idleCh <- streamResult{err: fmt.Errorf("session error: %s", raw)}
 		}
 	}
 	if err := stream.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "\nStream error: %v\n", err)
-		idleCh <- ""
+		idleCh <- streamResult{err: fmt.Errorf("stream error: %w", err)}
 	}
 }
 
@@ -349,7 +357,9 @@ func buildFixPrompt(findings []types.Finding, repoRoot string) string {
 }
 
 // collectFixFileContents reads the current on-disk content of every unique
-// file referenced in findings. Missing or unreadable files are silently skipped.
+// file referenced in findings. Paths are validated to stay within repoRoot
+// (guards against model-produced absolute paths or ../ traversal).
+// Missing, unreadable, or out-of-bounds files are silently skipped.
 func collectFixFileContents(repoRoot string, findings []types.Finding) map[string]string {
 	seen := make(map[string]bool)
 	contents := make(map[string]string)
@@ -358,7 +368,16 @@ func collectFixFileContents(repoRoot string, findings []types.Finding) map[strin
 			continue
 		}
 		seen[f.File] = true
-		data, err := os.ReadFile(filepath.Join(repoRoot, f.File))
+		clean := filepath.Clean(f.File)
+		if filepath.IsAbs(clean) {
+			continue
+		}
+		abs := filepath.Join(repoRoot, clean)
+		rel, err := filepath.Rel(repoRoot, abs)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		data, err := os.ReadFile(abs)
 		if err != nil {
 			continue
 		}
