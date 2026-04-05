@@ -36,6 +36,10 @@ func (c *RealClient) ValidateIssues(ctx context.Context, repoRoot string) ([]Iss
 	return ValidateIssues(ctx, c.client, c.owner, c.repo, repoRoot)
 }
 
+func (c *RealClient) FetchIssueIndex(ctx context.Context) (IssueIndex, error) {
+	return BuildIssueIndex(ctx, c.client, c.owner, c.repo)
+}
+
 func (c *RealClient) ExistingIssueTitles(ctx context.Context) (map[string]bool, error) {
 	return ExistingIssueTitles(ctx, c.client, c.owner, c.repo)
 }

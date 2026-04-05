@@ -144,15 +144,11 @@ func fileIssues(ctx context.Context, port gh.Port, prNum int,
 	reviewText string, openIssues []int, log *logger.Logger) ([]int, error) {
 
 	findings := review.ParseFindings(reviewText)
-	seen, err := port.ExistingIssueTitles(ctx)
+	idx, err := port.FetchIssueIndex(ctx)
 	if err != nil {
-		return openIssues, wrapErr("failed to list existing issues", err)
+		return openIssues, wrapErr("failed to fetch issue index", err)
 	}
-	fingerprints, err := port.ExistingFingerprints(ctx)
-	if err != nil {
-		return openIssues, wrapErr("failed to list existing fingerprints", err)
-	}
-	newIssues, updatedOpen, err := createIssuesForFindings(ctx, port, prNum, findings, seen, fingerprints, openIssues, log)
+	newIssues, updatedOpen, err := createIssuesForFindings(ctx, port, prNum, findings, idx.Titles, idx.Fingerprints, openIssues, log)
 	if err != nil {
 		return openIssues, err
 	}

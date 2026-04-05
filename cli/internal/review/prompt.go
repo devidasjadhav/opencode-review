@@ -164,11 +164,11 @@ func BuildAuditPrompt(repoRoot string, changedFiles map[string]bool) (string, er
 	lang := langdetect.Detect(repoRoot)
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Perform a full SOLID and DRY audit of this %s codebase.\n", lang.Name)
+	fmt.Fprintf(&sb, "Perform a SOLID and DRY audit of the %s files provided below.\n", lang.Name)
 	if len(changedFiles) > 0 {
 		sb.WriteString("Note: Only showing files changed since last audit. Unchanged files have already been reviewed.\n\n")
 	}
-	sb.WriteString("Read ALL files below in full. For every violation report EXACTLY:\n\n")
+	sb.WriteString("Read each file below in full. For every violation report EXACTLY:\n\n")
 	sb.WriteString("## Findings\n")
 	sb.WriteString("For EVERY violation use EXACTLY this format (no list markers, use ### headers):\n\n")
 	findingsFormat(&sb)

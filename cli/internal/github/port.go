@@ -14,6 +14,7 @@ type Port interface {
 	EnsureOpenPR(ctx context.Context, repoRoot, baseBranch string) (prNum int, created bool, err error)
 	PostPRReview(ctx context.Context, prNum int, body, verdict string) error
 	ValidateIssues(ctx context.Context, repoRoot string) ([]IssueValidity, error)
+	FetchIssueIndex(ctx context.Context) (IssueIndex, error)
 	ExistingIssueTitles(ctx context.Context) (map[string]bool, error)
 	ExistingFingerprints(ctx context.Context) (map[string]int, error)
 	ListOpenIssueSummaries(ctx context.Context) ([]types.IssueSummary, error)

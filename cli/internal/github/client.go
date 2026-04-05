@@ -73,6 +73,38 @@ func ListOpenIssues(ctx context.Context, gh *gogithub.Client, owner, repo string
 // fingerprintRe matches the hidden fingerprint comment embedded in issue bodies.
 var fingerprintRe = regexp.MustCompile(`<!-- opencode-fingerprint: ([0-9a-f]{64}) -->`)
 
+// IssueIndex consolidates all open-issue data needed by a single review loop
+// iteration into one paginated API fetch instead of three separate calls.
+type IssueIndex struct {
+	Titles       map[string]bool   // issue title → exists
+	Fingerprints map[string]int    // fingerprint → issue number
+	Summaries    []types.IssueSummary
+}
+
+// BuildIssueIndex fetches open issues once and populates all three index views.
+func BuildIssueIndex(ctx context.Context, gh *gogithub.Client, owner, repo string) (IssueIndex, error) {
+	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	if err != nil {
+		return IssueIndex{}, err
+	}
+	idx := IssueIndex{
+		Titles:       make(map[string]bool, len(issues)),
+		Fingerprints: make(map[string]int, len(issues)),
+		Summaries:    make([]types.IssueSummary, 0, len(issues)),
+	}
+	for _, i := range issues {
+		idx.Titles[i.GetTitle()] = true
+		if ms := fingerprintRe.FindStringSubmatch(i.GetBody()); ms != nil {
+			idx.Fingerprints[ms[1]] = i.GetNumber()
+		}
+		idx.Summaries = append(idx.Summaries, types.IssueSummary{
+			Number: i.GetNumber(),
+			Title:  i.GetTitle(),
+		})
+	}
+	return idx, nil
+}
+
 // ExistingFingerprints returns a map of fingerprint → issue number for open opencode-review issues.
 func ExistingFingerprints(ctx context.Context, gh *gogithub.Client, owner, repo string) (map[string]int, error) {
 	issues, err := ListOpenIssues(ctx, gh, owner, repo)

@@ -283,8 +283,8 @@ func buildReviewContext(env runEnvironment, ghCtx githubContext, cfg runConfig, 
 
 	// Tell the model which issues are already tracked so it doesn't re-report them.
 	if ghCtx.gh != nil {
-		if summaries, err := ghCtx.gh.ListOpenIssueSummaries(env.ctx); err == nil {
-			rctx.ExistingIssues = summaries
+		if idx, err := ghCtx.gh.FetchIssueIndex(env.ctx); err == nil {
+			rctx.ExistingIssues = idx.Summaries
 		}
 	}
 

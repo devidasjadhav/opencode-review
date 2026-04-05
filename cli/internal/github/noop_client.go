@@ -33,6 +33,13 @@ func (NoOpClient) ValidateIssues(_ context.Context, _ string) ([]IssueValidity, 
 	return nil, nil
 }
 
+func (NoOpClient) FetchIssueIndex(_ context.Context) (IssueIndex, error) {
+	return IssueIndex{
+		Titles:       map[string]bool{},
+		Fingerprints: map[string]int{},
+	}, nil
+}
+
 func (NoOpClient) ExistingIssueTitles(_ context.Context) (map[string]bool, error) {
 	return map[string]bool{}, nil
 }

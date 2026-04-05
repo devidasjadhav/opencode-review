@@ -24,6 +24,9 @@ func (m *mockGitHub) ValidateIssues(_ context.Context, _ string) ([]gh.IssueVali
 	m.validateCalled++
 	return m.validateResult, m.validateErr
 }
+func (m *mockGitHub) FetchIssueIndex(_ context.Context) (gh.IssueIndex, error) {
+	return gh.IssueIndex{Titles: map[string]bool{}, Fingerprints: map[string]int{}}, nil
+}
 func (m *mockGitHub) ExistingIssueTitles(_ context.Context) (map[string]bool, error) {
 	return map[string]bool{}, nil
 }
