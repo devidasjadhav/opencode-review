@@ -372,12 +372,21 @@ func collectFixFileContents(repoRoot string, findings []types.Finding) map[strin
 		if filepath.IsAbs(clean) {
 			continue
 		}
-		abs := filepath.Join(repoRoot, clean)
-		rel, err := filepath.Rel(repoRoot, abs)
+		repoAbs, err := filepath.Abs(repoRoot)
+		if err != nil {
+			continue
+		}
+		abs := filepath.Join(repoAbs, clean)
+		// Resolve symlinks so a symlink pointing outside repoRoot is caught.
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(repoAbs, resolved)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 			continue
 		}
-		data, err := os.ReadFile(abs)
+		data, err := os.ReadFile(resolved)
 		if err != nil {
 			continue
 		}
