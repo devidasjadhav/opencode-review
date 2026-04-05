@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/talk/opencode-client/internal/git"
@@ -140,8 +139,8 @@ func (mergeStep) Run(state *loopState) (bool, error) {
 		state.stop = true
 		return false, nil
 	}
-	if err := ensureMergeConstraints(state.cfg, state.result.verdict); err != nil {
-		return false, err
+	if state.cfg.mergeOnApprove && !state.cfg.autoFix && !canMergeOnApprove(state.cfg, state.result.verdict) {
+		state.stop = true
 	}
 	return false, nil
 }
@@ -153,13 +152,8 @@ func (autoFixStep) Run(state *loopState) (bool, error) {
 		return false, nil
 	}
 	findings := review.ParseFindings(state.result.reviewText)
-	hasFixable := false
-	for _, f := range findings {
-		if f.AgentPrompt != "" && meetsConfidence(f.Confidence, state.cfg.minConfidence) {
-			hasFixable = true
-			break
-		}
-	}
+	fixable := filterFixableFindings(findings, state.cfg.minConfidence)
+	hasFixable := len(fixable) > 0
 	if len(findings) > 0 && !hasFixable {
 		fmt.Fprintln(os.Stderr, "\nAuto-fix: no fixable findings at required confidence — cannot auto-fix. Manual intervention required.")
 		state.stop = true
@@ -225,24 +219,12 @@ func runReviewIteration(env runEnvironment, selected types.ModelInfo, cfg runCon
 	}, nil
 }
 
-func ensureMergeConstraints(cfg runConfig, verdict string) error {
-	if cfg.mergeOnApprove && !cfg.autoFix && verdict != "APPROVE" {
-		return fmt.Errorf("not merging: verdict is not APPROVE")
-	}
-	return nil
-}
-
 func runAutoFixIfNeeded(env runEnvironment, selected types.ModelInfo, cfg runConfig, reviewText string, iteration int) (bool, []string, error) {
 	if !cfg.autoFix {
 		return false, nil, nil
 	}
 	findings := review.ParseFindings(reviewText)
-	var fixable []types.Finding
-	for _, f := range findings {
-		if f.AgentPrompt != "" && meetsConfidence(f.Confidence, cfg.minConfidence) {
-			fixable = append(fixable, f)
-		}
-	}
+	fixable := filterFixableFindings(findings, cfg.minConfidence)
 	if len(fixable) == 0 {
 		return false, nil, nil
 	}
@@ -256,15 +238,14 @@ func runAutoFixIfNeeded(env runEnvironment, selected types.ModelInfo, cfg runCon
 	return n > 0, changedPaths, nil
 }
 
-// meetsConfidence returns true if findingConf >= minConf.
-// Empty confidence is treated as MEDIUM for backward compatibility.
-func meetsConfidence(findingConf, minConf string) bool {
-	rank := map[string]int{"LOW": 1, "MEDIUM": 2, "HIGH": 3}
-	fc := findingConf
-	if fc == "" {
-		fc = "MEDIUM"
+func filterFixableFindings(findings []types.Finding, minConfidence string) []types.Finding {
+	fixable := make([]types.Finding, 0, len(findings))
+	for _, f := range findings {
+		if f.AgentPrompt != "" && review.MeetsConfidence(f.Confidence, minConfidence) {
+			fixable = append(fixable, f)
+		}
 	}
-	return rank[fc] >= rank[strings.ToUpper(minConf)]
+	return fixable
 }
 
 func pathsToRelMap(paths []string, repoRoot string) map[string]bool {
