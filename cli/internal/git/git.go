@@ -110,6 +110,26 @@ func IsOperationalArtifact(path string) bool {
 	return strings.HasPrefix(p, "logs/")
 }
 
+// DiffHead returns the stat+patch output of the current HEAD commit.
+func DiffHead(repoRoot string) (string, error) {
+	return Run(repoRoot, "show", "--stat", "--patch", "HEAD")
+}
+
+// RevertHead creates a revert commit for HEAD and pushes it to origin.
+func RevertHead(repoRoot string) error {
+	if _, err := Run(repoRoot, "revert", "HEAD", "--no-edit"); err != nil {
+		return fmt.Errorf("git revert HEAD: %w", err)
+	}
+	branch, err := Run(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return fmt.Errorf("git branch name: %w", err)
+	}
+	if _, err := Run(repoRoot, "push", "origin", branch); err != nil {
+		return fmt.Errorf("git push after revert: %w", err)
+	}
+	return nil
+}
+
 func FixerStagePaths(before, after map[string]StatusSnapshotEntry) []string {
 	var paths []string
 	for path, afterStatus := range after {

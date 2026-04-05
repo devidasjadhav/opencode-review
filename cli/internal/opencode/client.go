@@ -174,6 +174,11 @@ func RunReview(client *sdk.Client, ctx context.Context, repoRoot string, selecte
 	return streamSession(client, ctx, repoRoot, selected, prompt, os.Stdout)
 }
 
+// RunVerify sends a verification prompt to the verifier model and returns the full response.
+func RunVerify(client *sdk.Client, ctx context.Context, repoRoot string, verifier types.ModelInfo, prompt string) (string, error) {
+	return streamSession(client, ctx, repoRoot, verifier, prompt, os.Stdout)
+}
+
 // RunFix sends fix prompts for all findings, commits and pushes any changes.
 // Returns the number of findings sent for fixing.
 type FixPersister interface {
