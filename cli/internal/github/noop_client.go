@@ -13,9 +13,14 @@ import (
 // runs normally and prints what it would do.
 type NoOpClient struct{}
 
+// dryRunPRNum is the synthetic PR number used in dry-run mode.
+// Non-zero so PR-linked logic (issue comments, linking, merging) runs
+// and prints its "[dry-run] Would ..." lines rather than silently skipping.
+const dryRunPRNum = 1
+
 func (NoOpClient) EnsureOpenPR(_ context.Context, _, _ string) (int, bool, error) {
-	fmt.Println("[dry-run] Would ensure open PR (skipped)")
-	return 0, false, nil
+	fmt.Printf("[dry-run] Would ensure open PR (simulated as #%d)\n", dryRunPRNum)
+	return dryRunPRNum, true, nil
 }
 
 func (NoOpClient) PostPRReview(_ context.Context, prNum int, _, verdict string) error {
