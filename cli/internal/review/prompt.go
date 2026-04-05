@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/talk/opencode-client/internal/langdetect"
 	"github.com/talk/opencode-client/internal/types"
 )
 
@@ -140,12 +142,29 @@ func BuildReviewPrompt(hash, subject, body, diff string, rctx ReviewContext) str
 	return sb.String()
 }
 
-// BuildAuditPrompt builds a full SOLID/DRY audit prompt embedding Go source files.
-// changedFiles, when non-nil and non-empty, restricts embedding to only those files
-// (relative to repoRoot). Pass nil for a full audit on the first iteration.
+// auditBudgetChars is the maximum total characters of file content embedded in
+// an audit prompt. Keeps the prompt within model context limits (~75K tokens).
+const auditBudgetChars = 300_000
+
+// auditFile holds metadata for a candidate source file during prompt assembly.
+type auditFile struct {
+	relPath string
+	size    int64
+	modTime time.Time
+}
+
+// BuildAuditPrompt builds a full SOLID/DRY audit prompt.
+// The project language is auto-detected from repoRoot marker files so the
+// audit works for Go, Python, TypeScript, Rust, or any unknown language.
+// changedFiles, when non-nil and non-empty, restricts embedding to only those
+// files (relative to repoRoot). Pass nil for a full first-iteration audit.
+// Files are sorted by modification time (most recent first) and embedded until
+// the context budget is reached; a note is added when files are omitted.
 func BuildAuditPrompt(repoRoot string, changedFiles map[string]bool) (string, error) {
+	lang := langdetect.Detect(repoRoot)
+
 	var sb strings.Builder
-	sb.WriteString("Perform a full SOLID and DRY audit of this codebase.\n")
+	fmt.Fprintf(&sb, "Perform a full SOLID and DRY audit of this %s codebase.\n", lang.Name)
 	if len(changedFiles) > 0 {
 		sb.WriteString("Note: Only showing files changed since last audit. Unchanged files have already been reviewed.\n\n")
 	}
@@ -160,32 +179,64 @@ func BuildAuditPrompt(repoRoot string, changedFiles map[string]bool) (string, er
 	sb.WriteString("`REQUEST CHANGES` — violations must be fixed.\n\n")
 	sb.WriteString("---\n")
 
-	err := filepath.WalkDir(filepath.Join(repoRoot, "cli"), func(path string, d fs.DirEntry, err error) error {
+	// Collect candidate files respecting changedFiles filter.
+	var candidates []auditFile
+	err := filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
 		if d.IsDir() {
-			if d.Name() == "vendor" || d.Name() == ".git" {
+			if langdetect.SkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+		if !lang.HasExtension(path) || lang.IsTestFile(path) {
 			return nil
 		}
 		rel, _ := filepath.Rel(repoRoot, path)
 		if len(changedFiles) > 0 && !changedFiles[rel] {
 			return nil
 		}
-		content, readErr := os.ReadFile(path)
-		if readErr != nil {
+		info, infoErr := d.Info()
+		if infoErr != nil {
 			return nil
 		}
-		fmt.Fprintf(&sb, "\n### File: %s\n```go\n%s\n```\n", rel, string(content))
+		candidates = append(candidates, auditFile{relPath: rel, size: info.Size(), modTime: info.ModTime()})
 		return nil
 	})
 	if err != nil {
 		return "", err
 	}
+
+	// Sort most-recently-modified first so the freshest code is embedded
+	// when the budget forces omissions.
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
+
+	// Embed files until the context budget is exhausted.
+	used, omitted := 0, 0
+	for _, f := range candidates {
+		if used+int(f.size) > auditBudgetChars {
+			omitted++
+			continue
+		}
+		content, readErr := os.ReadFile(filepath.Join(repoRoot, f.relPath))
+		if readErr != nil {
+			continue
+		}
+		tag := lang.FenceTag
+		if tag == "" {
+			tag = strings.TrimPrefix(filepath.Ext(f.relPath), ".")
+		}
+		fmt.Fprintf(&sb, "\n### File: %s\n```%s\n%s\n```\n", f.relPath, tag, string(content))
+		used += len(content)
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&sb, "\n_Note: %d file(s) omitted — context budget reached (%d KB). Re-run with focused --commit mode to review those files._\n",
+			omitted, auditBudgetChars/1024)
+	}
+
 	return sb.String(), nil
 }
