@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,15 +20,24 @@ func loadEnvFile(dir string) map[string]string {
 		path := filepath.Join(dir, name)
 		f, err := os.Open(path)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "Warning: cannot read %s: %v\n", path, err)
+			return nil
 		}
 		defer f.Close()
-		return parseEnvFile(f)
+		m, err := parseEnvFile(f)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+			return nil
+		}
+		return m
 	}
 	return nil
 }
 
-func parseEnvFile(f *os.File) map[string]string {
+func parseEnvFile(f *os.File) (map[string]string, error) {
 	m := make(map[string]string)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -40,7 +51,10 @@ func parseEnvFile(f *os.File) map[string]string {
 		}
 		m[strings.TrimSpace(k)] = strings.TrimSpace(v)
 	}
-	return m
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("parse env file: %w", err)
+	}
+	return m, nil
 }
 
 // prescanDir extracts --dir / -dir value from os.Args before flag.Parse().
