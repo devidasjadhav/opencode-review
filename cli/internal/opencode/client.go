@@ -81,8 +81,8 @@ func SelectModel(models []types.ModelInfo) (types.ModelInfo, error) {
 
 // streamSession creates an opencode session, sends prompt, streams the response
 // and returns the full text when the session goes idle.
-// printText controls whether text deltas are printed to stdout.
-func streamSession(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string, printText bool) (string, error) {
+// renderer receives streamed text deltas when non-nil.
+func streamSession(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string, renderer io.Writer) (string, error) {
 	session, err := client.Session.New(ctx, sdk.SessionNewParams{
 		Directory: sdk.F(repoRoot),
 	})
@@ -96,51 +96,12 @@ func streamSession(client *sdk.Client, ctx context.Context, repoRoot string, sel
 
 	idleCh := make(chan string, 2)
 	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stream := client.Event.ListStreaming(streamCtx, sdk.EventListParams{
 		Directory: sdk.F(repoRoot),
 	})
 
-	go func() {
-		defer cancel()
-		var buf strings.Builder
-		for stream.Next() {
-			event := stream.Current()
-			switch event.Type {
-			case "message.part.delta":
-				var envelope struct {
-					Properties struct {
-						Field string `json:"field"`
-						Delta string `json:"delta"`
-					} `json:"properties"`
-				}
-				if err := json.Unmarshal([]byte(event.JSON.RawJSON()), &envelope); err == nil {
-					if envelope.Properties.Field == "text" {
-						if printText {
-							fmt.Print(envelope.Properties.Delta)
-						}
-						buf.WriteString(envelope.Properties.Delta)
-					}
-					// "reasoning" field tokens are suppressed
-				}
-			case sdk.EventListResponseTypeSessionIdle:
-				idle, ok := event.AsUnion().(sdk.EventListResponseEventSessionIdle)
-				if ok && idle.Properties.SessionID == sessionID {
-					if printText {
-						fmt.Println()
-						fmt.Println()
-					}
-					idleCh <- buf.String()
-				}
-			case sdk.EventListResponseTypeSessionError:
-				fmt.Fprintf(os.Stderr, "\n[session error] %s\n", event.JSON.RawJSON())
-				idleCh <- ""
-			}
-		}
-		if err := stream.Err(); err != nil && streamCtx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "\nStream error: %v\n", err)
-			idleCh <- ""
-		}
-	}()
+	go consumeSessionEvents(stream, sessionID, renderer, idleCh, cancel)
 
 	_, err = client.Session.Prompt(ctx, sessionID, sdk.SessionPromptParams{
 		Directory: sdk.F(repoRoot),
@@ -156,14 +117,61 @@ func streamSession(client *sdk.Client, ctx context.Context, repoRoot string, sel
 		}),
 	})
 	if err != nil {
+		cancel()
 		return "", fmt.Errorf("error sending prompt: %w", err)
 	}
 	return <-idleCh, nil
 }
 
+func consumeSessionEvents(stream sessionEventStream, sessionID string, renderer io.Writer, idleCh chan<- string, cancel context.CancelFunc) {
+	defer cancel()
+	var buf strings.Builder
+	for stream.Next() {
+		event := stream.Current()
+		switch event.Type {
+		case "message.part.delta":
+			decodeAndRenderMessageDelta(event.JSON.RawJSON(), renderer, &buf)
+		case sdk.EventListResponseTypeSessionIdle:
+			idle, ok := event.AsUnion().(sdk.EventListResponseEventSessionIdle)
+			if ok && idle.Properties.SessionID == sessionID {
+				if renderer != nil {
+					_, _ = io.WriteString(renderer, "\n\n")
+				}
+				idleCh <- buf.String()
+			}
+		case sdk.EventListResponseTypeSessionError:
+			fmt.Fprintf(os.Stderr, "\n[session error] %s\n", event.JSON.RawJSON())
+			idleCh <- ""
+		}
+	}
+	if err := stream.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "\nStream error: %v\n", err)
+		idleCh <- ""
+	}
+}
+
+func decodeAndRenderMessageDelta(rawJSON string, renderer io.Writer, buf *strings.Builder) {
+	var envelope struct {
+		Properties struct {
+			Field string `json:"field"`
+			Delta string `json:"delta"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(rawJSON), &envelope); err != nil {
+		return
+	}
+	if envelope.Properties.Field != "text" {
+		return
+	}
+	if renderer != nil {
+		_, _ = io.WriteString(renderer, envelope.Properties.Delta)
+	}
+	buf.WriteString(envelope.Properties.Delta)
+}
+
 // RunReview sends a review prompt and returns the full streamed response.
 func RunReview(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string) (string, error) {
-	return streamSession(client, ctx, repoRoot, selected, prompt, true)
+	return streamSession(client, ctx, repoRoot, selected, prompt, os.Stdout)
 }
 
 // RunFix sends fix prompts for all findings, commits and pushes any changes.
@@ -172,19 +180,25 @@ type FixPersister interface {
 	Persist(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error)
 }
 
-type gitFixPersister struct{}
+type gitFixPersister struct {
+	validator FixValidator
+}
 
 func NewGitFixPersister() FixPersister {
-	return gitFixPersister{}
+	return gitFixPersister{validator: NewGoBuildFixValidator()}
 }
 
-func (gitFixPersister) Persist(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error) {
-	return stageCommitPushFixes(repoRoot, findings, iteration, stagePaths)
+func NewGitFixPersisterWithValidator(validator FixValidator) FixPersister {
+	return gitFixPersister{validator: validator}
 }
 
-func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int, persister FixPersister) (int, error) {
+func (p gitFixPersister) Persist(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error) {
+	return stageCommitPushFixes(repoRoot, findings, iteration, stagePaths, p.validator)
+}
+
+func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int, persister FixPersister) (int, []string, error) {
 	if len(findings) == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 	if persister == nil {
 		persister = NewGitFixPersister()
@@ -192,21 +206,21 @@ func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected t
 	prompt := buildFixPrompt(findings)
 	applyResult, err := applyFixPrompt(client, ctx, repoRoot, selected, prompt)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if applyResult.Outcome != fixApplyChanged {
 		fmt.Println("  (no file changes detected after fix)")
-		return 0, nil
+		return 0, nil, nil
 	}
 	persistResult, err := persister.Persist(repoRoot, findings, iteration, applyResult.StagePaths)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if persistResult.Outcome != fixPersistCommitted {
-		return 0, nil
+		return 0, nil, nil
 	}
 	fmt.Printf("  Committed and pushed fixes: %q\n", persistResult.CommitMessage)
-	return len(findings), nil
+	return len(findings), applyResult.StagePaths, nil
 }
 
 type fixApplyOutcome int
@@ -236,6 +250,12 @@ type fixPersistResult struct {
 type runFixError struct {
 	Context string
 	Err     error
+}
+
+type sessionEventStream interface {
+	Next() bool
+	Current() sdk.EventListResponse
+	Err() error
 }
 
 func (e runFixError) Error() string {
@@ -269,7 +289,7 @@ func applyFixPrompt(client *sdk.Client, ctx context.Context, repoRoot string, se
 	if err != nil {
 		return fixApplyResult{}, runFixError{Context: "Fix status snapshot error", Err: err}
 	}
-	if _, err := streamSession(client, ctx, repoRoot, selected, prompt, true); err != nil {
+	if _, err := streamSession(client, ctx, repoRoot, selected, prompt, os.Stdout); err != nil {
 		return fixApplyResult{}, runFixError{Context: "Fix session error", Err: err}
 	}
 	afterStatus, err := git.StatusSnapshot(repoRoot)
@@ -283,7 +303,7 @@ func applyFixPrompt(client *sdk.Client, ctx context.Context, repoRoot string, se
 	return fixApplyResult{Outcome: fixApplyChanged, StagePaths: stagePaths}, nil
 }
 
-func stageCommitPushFixes(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error) {
+func stageCommitPushFixes(repoRoot string, findings []types.Finding, iteration int, stagePaths []string, validator FixValidator) (fixPersistResult, error) {
 	var validPaths []string
 	for _, p := range stagePaths {
 		abs := filepath.Join(repoRoot, p)
@@ -307,11 +327,13 @@ func stageCommitPushFixes(repoRoot string, findings []types.Finding, iteration i
 		fmt.Println("  (no file changes detected after fix)")
 		return fixPersistResult{Outcome: fixPersistNoop}, nil
 	}
-	// Build gate: verify the codebase compiles before committing.
-	if out, err := git.RunInDir(repoRoot, "go", "build", "./..."); err != nil {
-		// Restore changes so the working tree is clean for the next iteration.
-		git.Run(repoRoot, "checkout", "--", ".")  //nolint
-		return fixPersistResult{}, runFixError{Context: fmt.Sprintf("  build failed after fix — changes reverted:\n%s", out), Err: err}
+	if validator == nil {
+		validator = NewGoBuildFixValidator()
+	}
+	if err := validator.Validate(repoRoot, validPaths); err != nil {
+		restoreArgs := append([]string{"restore", "--staged", "--worktree", "--"}, validPaths...)
+		_, _ = git.Run(repoRoot, restoreArgs...)
+		return fixPersistResult{}, runFixError{Context: "  validation failed after fix — reverted fix paths", Err: err}
 	}
 
 	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)

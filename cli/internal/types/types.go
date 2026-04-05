@@ -1,5 +1,27 @@
 package types
 
+import "strings"
+
+// DefaultMergeStrategy is used when no --merge-strategy flag is provided.
+const DefaultMergeStrategy = "squash"
+
+var allowedMergeStrategies = []string{"merge", "squash", "rebase"}
+
+// MergeMethod validates and returns the GitHub merge method string.
+func MergeMethod(strategy string) (string, bool) {
+	for _, s := range allowedMergeStrategies {
+		if strings.EqualFold(strategy, s) {
+			return s, true
+		}
+	}
+	return "", false
+}
+
+// AllowedMergeStrategies returns a human-readable list of valid strategies.
+func AllowedMergeStrategies() string {
+	return strings.Join(allowedMergeStrategies, ", ")
+}
+
 // ModelInfo holds provider and model identity returned by the opencode API.
 type ModelInfo struct {
 	ProviderID   string
@@ -17,5 +39,7 @@ type Finding struct {
 	Description string
 	Diff        string
 	AgentPrompt string
-	IssueNumber int // set after GitHub issue is created
+	IssueNumber int    // set after GitHub issue is created
+	Fingerprint string // sha256(lower(file)|lower(title)|lower(desc[:50])); set by ParseFindings
+	Confidence  string // HIGH | MEDIUM | LOW; set by ParseFindings; empty = unrated
 }

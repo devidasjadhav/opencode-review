@@ -1,6 +1,8 @@
 package review
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"regexp"
 	"strings"
 
@@ -10,6 +12,57 @@ import (
 var findingHeader = regexp.MustCompile(
 	`(?i)###\s+` + "`" + `\[([^\]]+)\]` + "`" + `\s+(\S+):(\S*)\s+—\s+(.+)`,
 )
+
+var severityAliases = map[string]string{
+	"critical": "Critical",
+	"crit":     "Critical",
+	"high":     "High",
+	"medium":   "Medium",
+	"med":      "Medium",
+	"low":      "Low",
+}
+
+var severityAliasOrder = []string{"critical", "crit", "high", "medium", "med", "low"}
+
+func normalizeSeverity(raw string) string {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	for _, alias := range severityAliasOrder {
+		if strings.Contains(normalized, alias) {
+			return severityAliases[alias]
+		}
+	}
+	return "Low"
+}
+
+// computeFingerprint returns a stable sha256 of a finding's identity.
+// Line numbers excluded so reformatted-but-same issues still deduplicate.
+func computeFingerprint(file, title, desc string) string {
+	norm := strings.ToLower(strings.TrimSpace(file)) +
+		"|" + strings.ToLower(strings.TrimSpace(title)) +
+		"|" + strings.ToLower(strings.TrimSpace(truncate(desc, 50)))
+	sum := sha256.Sum256([]byte(norm))
+	return hex.EncodeToString(sum[:])
+}
+
+func truncate(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
+}
+
+func parseConfidence(val string) string {
+	val = strings.TrimSpace(val)
+	switch {
+	case strings.HasPrefix(val, "HIGH"):
+		return "HIGH"
+	case strings.HasPrefix(val, "MEDIUM"):
+		return "MEDIUM"
+	default:
+		return "LOW"
+	}
+}
 
 // ParseFindings extracts structured findings from a review response.
 func ParseFindings(reviewText string) []types.Finding {
@@ -27,6 +80,7 @@ func ParseFindings(reviewText string) []types.Finding {
 		current.AgentPrompt = strings.TrimSpace(strings.Join(agentLines, "\n"))
 		current.AgentPrompt = strings.TrimPrefix(current.AgentPrompt, "**AI agent fix prompt:**")
 		current.AgentPrompt = strings.TrimSpace(current.AgentPrompt)
+		current.Fingerprint = computeFingerprint(current.File, current.Title, current.Description)
 		findings = append(findings, *current)
 		current = nil
 		diffLines = nil
@@ -46,19 +100,8 @@ func ParseFindings(reviewText string) []types.Finding {
 		}
 		if m := findingHeader.FindStringSubmatch(trimmed); m != nil {
 			flush()
-			sev := strings.TrimSpace(m[1])
-			switch {
-			case strings.Contains(sev, "Critical"):
-				sev = "Critical"
-			case strings.Contains(sev, "High"):
-				sev = "High"
-			case strings.Contains(sev, "Medium"):
-				sev = "Medium"
-			default:
-				sev = "Low"
-			}
 			current = &types.Finding{
-				Severity:  sev,
+				Severity:  normalizeSeverity(strings.TrimSpace(m[1])),
 				File:      m[2],
 				LineRange: m[3],
 				Title:     strings.TrimSpace(m[4]),
@@ -78,6 +121,11 @@ func ParseFindings(reviewText string) []types.Finding {
 			} else {
 				diffLines = append(diffLines, line)
 			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "**Confidence:**") {
+			val := strings.TrimPrefix(trimmed, "**Confidence:**")
+			current.Confidence = parseConfidence(val)
 			continue
 		}
 		if strings.HasPrefix(trimmed, "**AI agent fix prompt:**") {
