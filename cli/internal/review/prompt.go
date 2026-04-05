@@ -12,8 +12,10 @@ func findingsFormat(sb *strings.Builder) {
 	sb.WriteString("For each finding use EXACTLY this format:\n\n")
 	sb.WriteString("### `[🔴 Critical|🟠 High|🟡 Medium|🔵 Low]` file:line-range — Short title\n")
 	sb.WriteString("Clear description referencing the exact code and which principle it violates.\n\n")
+	sb.WriteString("**Confidence:** HIGH (certain defect) | MEDIUM (likely issue) | LOW (style/preference)\n\n")
 	sb.WriteString("```diff\n- old code\n+ fixed code\n```\n\n")
 	sb.WriteString("**AI agent fix prompt:** One-paragraph instruction a coding agent can execute directly to fix this issue.\n\n")
+	sb.WriteString("Only report HIGH and MEDIUM confidence findings. Omit LOW confidence findings entirely.\n\n")
 	sb.WriteString("If there are no issues: write `_No issues found._` and skip subsections.\n\n")
 }
 
@@ -57,10 +59,15 @@ func BuildReviewPrompt(hash, subject, body, diff string) string {
 	return sb.String()
 }
 
-// BuildAuditPrompt builds a full SOLID/DRY audit prompt embedding all Go source files.
-func BuildAuditPrompt(repoRoot string) (string, error) {
+// BuildAuditPrompt builds a full SOLID/DRY audit prompt embedding Go source files.
+// changedFiles, when non-nil and non-empty, restricts embedding to only those files
+// (relative to repoRoot). Pass nil for a full audit on the first iteration.
+func BuildAuditPrompt(repoRoot string, changedFiles map[string]bool) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("Perform a full SOLID and DRY audit of this codebase.\n")
+	if len(changedFiles) > 0 {
+		sb.WriteString("Note: Only showing files changed since last audit. Unchanged files have already been reviewed.\n\n")
+	}
 	sb.WriteString("Read ALL files below in full. For every violation report EXACTLY:\n\n")
 	sb.WriteString("## Findings\n")
 	sb.WriteString("For EVERY violation use EXACTLY this format (no list markers, use ### headers):\n\n")
@@ -85,11 +92,14 @@ func BuildAuditPrompt(repoRoot string) (string, error) {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
+		rel, _ := filepath.Rel(repoRoot, path)
+		if len(changedFiles) > 0 && !changedFiles[rel] {
+			return nil
+		}
 		content, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return nil
 		}
-		rel, _ := filepath.Rel(repoRoot, path)
 		fmt.Fprintf(&sb, "\n### File: %s\n```go\n%s\n```\n", rel, string(content))
 		return nil
 	})

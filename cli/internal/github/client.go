@@ -3,6 +3,7 @@ package github
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,8 @@ import (
 	"github.com/talk/opencode-client/internal/git"
 	"github.com/talk/opencode-client/internal/types"
 )
+
+var ErrOpenPRNotFound = errors.New("no open PR found")
 
 // NewClient builds a GitHub API client authenticated via GITHUB_TOKEN.
 func NewClient(ctx context.Context) (*gogithub.Client, error) {
@@ -67,14 +70,35 @@ func ListOpenIssues(ctx context.Context, gh *gogithub.Client, owner, repo string
 	return all, nil
 }
 
+// fingerprintRe matches the hidden fingerprint comment embedded in issue bodies.
+var fingerprintRe = regexp.MustCompile(`<!-- opencode-fingerprint: ([0-9a-f]{64}) -->`)
+
+// ExistingFingerprints returns a map of fingerprint → issue number for open opencode-review issues.
+func ExistingFingerprints(ctx context.Context, gh *gogithub.Client, owner, repo string) (map[string]int, error) {
+	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]int, len(issues))
+	for _, i := range issues {
+		if ms := fingerprintRe.FindStringSubmatch(i.GetBody()); ms != nil {
+			m[ms[1]] = i.GetNumber()
+		}
+	}
+	return m, nil
+}
+
 // ExistingIssueTitles returns a set of open issue titles for deduplication.
-func ExistingIssueTitles(ctx context.Context, gh *gogithub.Client, owner, repo string) map[string]bool {
-	issues, _ := ListOpenIssues(ctx, gh, owner, repo)
+func ExistingIssueTitles(ctx context.Context, gh *gogithub.Client, owner, repo string) (map[string]bool, error) {
+	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	if err != nil {
+		return nil, err
+	}
 	seen := make(map[string]bool, len(issues))
 	for _, i := range issues {
 		seen[i.GetTitle()] = true
 	}
-	return seen
+	return seen, nil
 }
 
 // FindingIssueTitle returns the canonical GitHub issue title for a finding.
@@ -103,6 +127,9 @@ func CreateIssue(ctx context.Context, gh *gogithub.Client, owner, repo string, f
 		body.WriteString("\n")
 	}
 	body.WriteString("\n---\n_Reported by opencode-review_\n")
+	if f.Fingerprint != "" {
+		fmt.Fprintf(&body, "<!-- opencode-fingerprint: %s -->\n", f.Fingerprint)
+	}
 
 	bodyStr := body.String()
 	issue, _, err := gh.Issues.Create(ctx, owner, repo, &gogithub.IssueRequest{
@@ -160,25 +187,33 @@ func PostPRReview(ctx context.Context, gh *gogithub.Client, owner, repo string, 
 		Body:  &body,
 		Event: &event,
 	})
-	if err != nil && event != "COMMENT" {
-		if strings.Contains(err.Error(), "Can not approve your own") ||
-			strings.Contains(err.Error(), "own pull request") {
-			fmt.Fprintln(os.Stderr, "(falling back to COMMENT: cannot approve/request-changes own PR)")
-			comment := "COMMENT"
-			_, _, err = gh.PullRequests.CreateReview(ctx, owner, repo, prNum, &gogithub.PullRequestReviewRequest{
-				Body:  &body,
-				Event: &comment,
-			})
-		}
+	if err != nil && event != "COMMENT" && shouldFallbackToComment(err) {
+		fmt.Fprintln(os.Stderr, "(falling back to COMMENT review)")
+		comment := "COMMENT"
+		_, _, err = gh.PullRequests.CreateReview(ctx, owner, repo, prNum, &gogithub.PullRequestReviewRequest{
+			Body:  &body,
+			Event: &comment,
+		})
 	}
 	return err
 }
 
+func shouldFallbackToComment(err error) bool {
+	var ghErr *gogithub.ErrorResponse
+	if !errors.As(err, &ghErr) {
+		return false
+	}
+	if ghErr.Response == nil || ghErr.Response.StatusCode != 422 {
+		return false
+	}
+	return true
+}
+
 // MergePR merges the PR using the given strategy, optionally deleting the branch.
 func MergePR(ctx context.Context, gh *gogithub.Client, owner, repo string, prNum int, strategy string, deleteBranch bool) error {
-	method := map[string]string{"merge": "merge", "squash": "squash", "rebase": "rebase"}[strategy]
-	if method == "" {
-		return fmt.Errorf("invalid merge strategy %q: must be merge, squash, or rebase", strategy)
+	method, ok := types.MergeMethod(strategy)
+	if !ok {
+		return fmt.Errorf("invalid merge strategy %q: must be one of %s", strategy, types.AllowedMergeStrategies())
 	}
 	_, _, err := gh.PullRequests.Merge(ctx, owner, repo, prNum, "", &gogithub.PullRequestOptions{
 		MergeMethod: method,
@@ -212,7 +247,7 @@ func OpenPRNumber(ctx context.Context, gh *gogithub.Client, owner, repo, repoRoo
 		return 0, err
 	}
 	if len(prs) == 0 {
-		return 0, fmt.Errorf("no open PR found for branch %q", branch)
+		return 0, fmt.Errorf("%w for branch %q", ErrOpenPRNotFound, branch)
 	}
 	return prs[0].GetNumber(), nil
 }
@@ -222,6 +257,9 @@ func EnsureOpenPR(ctx context.Context, gh *gogithub.Client, owner, repo, repoRoo
 	num, err := OpenPRNumber(ctx, gh, owner, repo, repoRoot)
 	if err == nil {
 		return num, false, nil
+	}
+	if !errors.Is(err, ErrOpenPRNotFound) {
+		return 0, false, err
 	}
 	branch, err2 := git.Run(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	if err2 != nil {
