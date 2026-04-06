@@ -75,6 +75,81 @@ func TestParseFindingsNoFalsePositive(t *testing.T) {
 	}
 }
 
+func TestParseFindingsFingerprintNonEmpty(t *testing.T) {
+	reviewText := "## Findings\n" +
+		"### `[🟠 High]` cmd/run.go:10 — Missing error check\n" +
+		"The function ignores the returned error.\n"
+	findings := ParseFindings(reviewText)
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(findings))
+	}
+	if findings[0].Fingerprint == "" {
+		t.Error("Fingerprint should be non-empty")
+	}
+	if len(findings[0].Fingerprint) != 64 {
+		t.Errorf("Fingerprint length = %d, want 64 (sha256 hex)", len(findings[0].Fingerprint))
+	}
+}
+
+func TestParseFindingsFingerprintStableAcrossDifferentLineNumbers(t *testing.T) {
+	// Same file+title+desc but different line numbers → same fingerprint.
+	make := func(lineRange string) string {
+		return "## Findings\n" +
+			"### `[🟠 High]` cmd/run.go:" + lineRange + " — Missing error check\n" +
+			"The function ignores the returned error.\n"
+	}
+	f1 := ParseFindings(make("10"))
+	f2 := ParseFindings(make("99"))
+	if len(f1) != 1 || len(f2) != 1 {
+		t.Fatal("expected 1 finding each")
+	}
+	if f1[0].Fingerprint != f2[0].Fingerprint {
+		t.Errorf("fingerprint changed with line number: %q vs %q", f1[0].Fingerprint, f2[0].Fingerprint)
+	}
+}
+
+func TestParseFindingsConfidenceParsed(t *testing.T) {
+	reviewText := "## Findings\n" +
+		"### `[🟠 High]` cmd/run.go:10 — Missing error check\n" +
+		"The function ignores the returned error.\n" +
+		"**Confidence:** HIGH (certain defect)\n"
+	findings := ParseFindings(reviewText)
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(findings))
+	}
+	if findings[0].Confidence != "HIGH" {
+		t.Errorf("Confidence = %q, want HIGH", findings[0].Confidence)
+	}
+}
+
+func TestMeetsConfidenceTable(t *testing.T) {
+	tests := []struct {
+		findingConf string
+		minConf     string
+		want        bool
+	}{
+		{"HIGH", "HIGH", true},
+		{"HIGH", "MEDIUM", true},
+		{"HIGH", "LOW", true},
+		{"MEDIUM", "HIGH", false},
+		{"MEDIUM", "MEDIUM", true},
+		{"MEDIUM", "LOW", true},
+		{"LOW", "HIGH", false},
+		{"LOW", "MEDIUM", false},
+		{"LOW", "LOW", true},
+		// Empty confidence treated as MEDIUM.
+		{"", "MEDIUM", true},
+		{"", "HIGH", false},
+		{"", "LOW", true},
+	}
+	for _, tc := range tests {
+		got := MeetsConfidence(tc.findingConf, tc.minConf)
+		if got != tc.want {
+			t.Errorf("MeetsConfidence(%q, %q) = %v, want %v", tc.findingConf, tc.minConf, got, tc.want)
+		}
+	}
+}
+
 func TestParseFindingsNormalizesSeverity(t *testing.T) {
 	reviewText := "## Findings\n" +
 		"### `[🚨 CRITICAL]` file1.go:10 — broken thing\n" +

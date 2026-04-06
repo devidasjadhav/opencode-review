@@ -61,6 +61,50 @@ func TestBuildReviewPromptEmptyContext(t *testing.T) {
 	}
 }
 
+func TestBuildReviewPromptLSPPreambleIncluded(t *testing.T) {
+	rctx := ReviewContext{LSPEnabled: true}
+	prompt := BuildReviewPrompt("abc123", "feat: x", "", "diff", rctx)
+	if !strings.Contains(prompt, "LSP Navigation") {
+		t.Error("LSP preamble missing when LSPEnabled=true")
+	}
+	if !strings.Contains(prompt, "goToDefinition") {
+		t.Error("prompt should mention goToDefinition when LSPEnabled=true")
+	}
+	if !strings.Contains(prompt, "findReferences") {
+		t.Error("prompt should mention findReferences when LSPEnabled=true")
+	}
+}
+
+func TestBuildReviewPromptLSPPreambleOmitted(t *testing.T) {
+	rctx := ReviewContext{LSPEnabled: false}
+	prompt := BuildReviewPrompt("abc123", "feat: x", "", "diff", rctx)
+	if strings.Contains(prompt, "LSP Navigation") {
+		t.Error("LSP preamble should be absent when LSPEnabled=false")
+	}
+}
+
+func TestBuildAuditPromptLSPEnabled(t *testing.T) {
+	dir := t.TempDir()
+	prompt, err := BuildAuditPrompt(dir, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "LSP Navigation") {
+		t.Error("LSP preamble missing when lspEnabled=true in audit prompt")
+	}
+}
+
+func TestBuildAuditPromptLSPDisabled(t *testing.T) {
+	dir := t.TempDir()
+	prompt, err := BuildAuditPrompt(dir, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(prompt, "LSP Navigation") {
+		t.Error("LSP preamble should be absent when lspEnabled=false in audit prompt")
+	}
+}
+
 func TestBuildReviewPromptFilesSortedDeterministically(t *testing.T) {
 	rctx := ReviewContext{
 		ChangedFiles: map[string]string{

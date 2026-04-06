@@ -116,3 +116,60 @@ func TestDryRunFlagInConfig(t *testing.T) {
 		t.Fatal("dryRun field not set")
 	}
 }
+
+func TestLSPFlagInConfig(t *testing.T) {
+	cfg := runConfig{lspEnabled: true}
+	if !cfg.lspEnabled {
+		t.Fatal("lspEnabled field not set")
+	}
+}
+
+// TestRunIssueValidationAcceptsNarrowInterface verifies that runIssueValidation
+// accepts a gh.ValidationPort, not the full Port — confirming ISP compliance.
+func TestRunIssueValidationAcceptsNarrowInterface(t *testing.T) {
+	// mockValidation only implements ValidationPort (not full Port).
+	var port gh.ValidationPort = &mockGitHub{}
+	runIssueValidation(context.Background(), true, port, "/tmp/repo")
+}
+
+// TestFileIssuesAcceptsNarrowInterface verifies that fileIssues accepts
+// gh.IssueFilerPort — not the full Port — confirming ISP compliance.
+func TestFileIssuesAcceptsNarrowInterface(t *testing.T) {
+	// mockGitHub implements IssueFilerPort; passing it directly should compile.
+	var port gh.IssueFilerPort = &mockGitHub{}
+	// fileIssues needs review text with findings; empty text → no findings, no GitHub calls.
+	_, _ = fileIssues(context.Background(), port, 0, "", nil, nil)
+}
+
+func TestRunSummaryTracksIterations(t *testing.T) {
+	s := newRunSummary()
+	s.iterations = 3
+	s.issuesCreated = 5
+	s.fixesApplied = 2
+	s.finalVerdict = "APPROVE"
+
+	if s.iterations != 3 {
+		t.Errorf("iterations = %d, want 3", s.iterations)
+	}
+	if s.issuesCreated != 5 {
+		t.Errorf("issuesCreated = %d, want 5", s.issuesCreated)
+	}
+	if s.fixesApplied != 2 {
+		t.Errorf("fixesApplied = %d, want 2", s.fixesApplied)
+	}
+	if s.finalVerdict != "APPROVE" {
+		t.Errorf("finalVerdict = %q, want APPROVE", s.finalVerdict)
+	}
+}
+
+func TestRunSummaryPrintDoesNotPanic(t *testing.T) {
+	s := newRunSummary()
+	s.iterations = 1
+	s.issuesCreated = 2
+	s.fixesApplied = 1
+	s.fixesReverted = 0
+	s.finalVerdict = "REQUEST CHANGES"
+	// Should not panic regardless of logPath value.
+	s.print("")
+	s.print("/tmp/fake.jsonl")
+}
