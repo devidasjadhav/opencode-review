@@ -92,7 +92,7 @@ func printIssueValidation(validations []gh.IssueValidity) {
 	}
 }
 
-func reconcileStaleIssues(ctx context.Context, port issueCloser, validations []gh.IssueValidity) {
+func reconcileStaleIssues(ctx context.Context, port gh.IssueCloserPort, validations []gh.IssueValidity) {
 	for _, v := range validations {
 		if v.Valid {
 			continue
@@ -264,7 +264,7 @@ func verifyReviewedHead(repoRoot, hash string) error {
 	return nil
 }
 
-func closeRunIssues(ctx context.Context, port issueCloser, openIssues []int, log *logger.Logger) error {
+func closeRunIssues(ctx context.Context, port gh.IssueCloserPort, openIssues []int, log *logger.Logger) error {
 	closeNums := map[int]bool{}
 	for _, n := range openIssues {
 		closeNums[n] = true
@@ -299,13 +299,7 @@ type issueCloseOptions struct {
 	onClosed        func(issueNum int)
 }
 
-// issueCloser is the minimal interface needed to close an issue with an optional comment.
-type issueCloser interface {
-	CommentOnIssue(ctx context.Context, issueNum int, body string) error
-	CloseIssue(ctx context.Context, issueNum int) error
-}
-
-func closeIssueWithReporting(ctx context.Context, port issueCloser, issueNum int, opts issueCloseOptions) error {
+func closeIssueWithReporting(ctx context.Context, port gh.IssueCloserPort, issueNum int, opts issueCloseOptions) error {
 	if opts.preCloseComment != "" {
 		if err := port.CommentOnIssue(ctx, issueNum, opts.preCloseComment); err != nil && opts.onCommentError != nil {
 			opts.onCommentError(issueNum, err)

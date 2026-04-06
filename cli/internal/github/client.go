@@ -105,34 +105,6 @@ func BuildIssueIndex(ctx context.Context, gh *gogithub.Client, owner, repo strin
 	return idx, nil
 }
 
-// ExistingFingerprints returns a map of fingerprint → issue number for open opencode-review issues.
-func ExistingFingerprints(ctx context.Context, gh *gogithub.Client, owner, repo string) (map[string]int, error) {
-	idx, err := BuildIssueIndex(ctx, gh, owner, repo)
-	if err != nil {
-		return nil, err
-	}
-	return idx.Fingerprints, nil
-}
-
-// ExistingIssueTitles returns a set of open issue titles for deduplication.
-func ExistingIssueTitles(ctx context.Context, gh *gogithub.Client, owner, repo string) (map[string]bool, error) {
-	idx, err := BuildIssueIndex(ctx, gh, owner, repo)
-	if err != nil {
-		return nil, err
-	}
-	return idx.Titles, nil
-}
-
-// ListOpenIssueSummaries returns lightweight summaries of all open non-PR issues.
-// Used to populate ReviewContext so the model knows what is already tracked.
-func ListOpenIssueSummaries(ctx context.Context, gh *gogithub.Client, owner, repo string) ([]types.IssueSummary, error) {
-	idx, err := BuildIssueIndex(ctx, gh, owner, repo)
-	if err != nil {
-		return nil, err
-	}
-	return idx.Summaries, nil
-}
-
 // FindingIssueTitle returns the canonical GitHub issue title for a finding.
 func FindingIssueTitle(f types.Finding) string {
 	return fmt.Sprintf("[%s] %s:%s — %s", f.Severity, f.File, f.LineRange, f.Title)

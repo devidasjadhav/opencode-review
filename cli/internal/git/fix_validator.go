@@ -1,19 +1,19 @@
-package opencode
+package git
 
 import (
 	"fmt"
 	"path/filepath"
 	"strings"
-
-	"github.com/talk/opencode-client/internal/git"
 )
 
+// FixValidator validates a set of changed paths after a fix is applied.
 type FixValidator interface {
 	Validate(repoRoot string, changedPaths []string) error
 }
 
 type goBuildFixValidator struct{}
 
+// NewGoBuildFixValidator creates a FixValidator that runs go build on affected packages.
 func NewGoBuildFixValidator() FixValidator {
 	return goBuildFixValidator{}
 }
@@ -24,7 +24,7 @@ func (goBuildFixValidator) Validate(repoRoot string, changedPaths []string) erro
 		pkgs = []string{"./..."}
 	}
 	args := append([]string{"build"}, pkgs...)
-	out, err := git.RunInDir(repoRoot, "go", args...)
+	out, err := RunInDir(repoRoot, "go", args...)
 	if err != nil {
 		return fmt.Errorf("go build %s failed:\n%s: %w", strings.Join(pkgs, " "), out, err)
 	}

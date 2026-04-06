@@ -160,13 +160,14 @@ func ParseFindings(reviewText string) []types.Finding {
 	var findings []types.Finding
 	var current *types.Finding
 	var section string
-	var diffLines, agentLines []string
+	var diffLines, agentLines, descLines []string
 	inDiff := false
 
 	flush := func() {
 		if current == nil {
 			return
 		}
+		current.Description = strings.TrimSpace(strings.Join(descLines, "\n"))
 		current.Diff = strings.TrimSpace(strings.Join(diffLines, "\n"))
 		current.AgentPrompt = strings.TrimSpace(strings.Join(agentLines, "\n"))
 		current.AgentPrompt = strings.TrimPrefix(current.AgentPrompt, "**AI agent fix prompt:**")
@@ -174,6 +175,7 @@ func ParseFindings(reviewText string) []types.Finding {
 		current.Fingerprint = computeFingerprint(current.File, current.Title, current.Description)
 		findings = append(findings, *current)
 		current = nil
+		descLines = nil
 		diffLines = nil
 		agentLines = nil
 		inDiff = false
@@ -229,7 +231,7 @@ func ParseFindings(reviewText string) []types.Finding {
 			continue
 		}
 		if trimmed != "" {
-			current.Description += line + "\n"
+			descLines = append(descLines, line)
 		}
 	}
 	flush()

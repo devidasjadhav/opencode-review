@@ -23,7 +23,7 @@ type runEnvironment struct {
 	repoRoot     string
 	client       *sdk.Client
 	log          *logger.Logger
-	fixPersister occ.FixPersister
+	fixPersister git.FixPersister
 }
 
 func initEnvironment(cfg runConfig) (runEnvironment, error) {
@@ -51,7 +51,7 @@ func initEnvironment(cfg runConfig) (runEnvironment, error) {
 		repoRoot:     repoRoot,
 		client:       occ.NewClient(cfg.serverURL),
 		log:          logger.New(repoRoot),
-		fixPersister: occ.NewGitFixPersister(),
+		fixPersister: git.NewGitFixPersister(),
 	}, nil
 }
 
@@ -70,26 +70,26 @@ func checkLSPEnvironment() {
 	fmt.Fprintln(os.Stderr, "  Proceeding — model will attempt to use LSP tools but they may not be available.")
 }
 
-func mustCreateFixBranchIfRequested(repoRoot string, cfg *runConfig) error {
+func mustCreateFixBranchIfRequested(repoRoot string, cfg runConfig) (runConfig, error) {
 	if !cfg.createBranch {
-		return nil
+		return cfg, nil
 	}
 	newBranch := fmt.Sprintf("fix/opencode-%s", time.Now().Format("20060102-150405"))
 	_, err := git.Run(repoRoot, "checkout", "-b", newBranch)
 	if err != nil {
-		return wrapErr(fmt.Sprintf("Failed to create branch %q", newBranch), err)
+		return cfg, wrapErr(fmt.Sprintf("Failed to create branch %q", newBranch), err)
 	}
 	_, err = git.Run(repoRoot, "commit", "--allow-empty", "-m", "chore: open fix branch for opencode-review")
 	if err != nil {
-		return wrapErr("Failed to create empty commit", err)
+		return cfg, wrapErr("Failed to create empty commit", err)
 	}
 	_, err = git.Run(repoRoot, "push", "-u", "origin", newBranch)
 	if err != nil {
-		return wrapErr(fmt.Sprintf("Failed to push branch %q", newBranch), err)
+		return cfg, wrapErr(fmt.Sprintf("Failed to push branch %q", newBranch), err)
 	}
 	fmt.Printf("Created and pushed branch %q\n", newBranch)
 	cfg.auditMode = true
-	return nil
+	return cfg, nil
 }
 
 func selectModel(env runEnvironment, cfg runConfig) (types.ModelInfo, error) {

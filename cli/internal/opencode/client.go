@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +15,7 @@ import (
 	sdk "github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
 
+	"github.com/talk/opencode-client/internal/apperr"
 	"github.com/talk/opencode-client/internal/git"
 	"github.com/talk/opencode-client/internal/types"
 )
@@ -101,6 +101,10 @@ func streamSession(client *sdk.Client, ctx context.Context, repoRoot string, sel
 		lastErr = err
 		// Don't retry if the caller cancelled the context.
 		if ctx.Err() != nil {
+			return "", err
+		}
+		// Don't retry permanent errors (e.g. auth failures, bad model IDs).
+		if !apperr.IsTransient(apperr.ClassifyOpencode(err)) {
 			return "", err
 		}
 		if attempt < streamMaxAttempts {
@@ -227,33 +231,13 @@ func RunVerify(client *sdk.Client, ctx context.Context, repoRoot string, verifie
 }
 
 // RunFix sends fix prompts for all findings, commits and pushes any changes.
-// Returns the number of findings sent for fixing.
-type FixPersister interface {
-	Persist(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error)
-}
-
-type gitFixPersister struct {
-	validator FixValidator
-}
-
-func NewGitFixPersister() FixPersister {
-	return gitFixPersister{validator: NewGoBuildFixValidator()}
-}
-
-func NewGitFixPersisterWithValidator(validator FixValidator) FixPersister {
-	return gitFixPersister{validator: validator}
-}
-
-func (p gitFixPersister) Persist(repoRoot string, findings []types.Finding, iteration int, stagePaths []string) (fixPersistResult, error) {
-	return stageCommitPushFixes(repoRoot, findings, iteration, stagePaths, p.validator)
-}
-
-func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int, persister FixPersister, lspEnabled bool) (int, []string, error) {
+// Returns the number of findings fixed and the paths that were committed.
+func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int, persister git.FixPersister, lspEnabled bool) (int, []string, error) {
 	if len(findings) == 0 {
 		return 0, nil, nil
 	}
 	if persister == nil {
-		persister = NewGitFixPersister()
+		persister = git.NewGitFixPersister()
 	}
 	prompt := buildFixPrompt(findings, repoRoot, lspEnabled)
 	applyResult, err := applyFixPrompt(client, ctx, repoRoot, selected, prompt)
@@ -264,15 +248,14 @@ func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected t
 		fmt.Println("  (no file changes detected after fix)")
 		return 0, nil, nil
 	}
-	persistResult, err := persister.Persist(repoRoot, findings, iteration, applyResult.StagePaths)
+	committedPaths, err := persister.Persist(repoRoot, findings, iteration, applyResult.StagePaths)
 	if err != nil {
 		return 0, nil, err
 	}
-	if persistResult.Outcome != fixPersistCommitted {
+	if len(committedPaths) == 0 {
 		return 0, nil, nil
 	}
-	fmt.Printf("  Committed and pushed fixes: %q\n", persistResult.CommitMessage)
-	return len(findings), applyResult.StagePaths, nil
+	return len(findings), committedPaths, nil
 }
 
 type fixApplyOutcome int
@@ -287,31 +270,10 @@ type fixApplyResult struct {
 	StagePaths []string
 }
 
-type fixPersistOutcome int
-
-const (
-	fixPersistNoop fixPersistOutcome = iota
-	fixPersistCommitted
-)
-
-type fixPersistResult struct {
-	Outcome       fixPersistOutcome
-	CommitMessage string
-}
-
-type runFixError struct {
-	Context string
-	Err     error
-}
-
 type sessionEventStream interface {
 	Next() bool
 	Current() sdk.EventListResponse
 	Err() error
-}
-
-func (e runFixError) Error() string {
-	return fmt.Sprintf("%s: %v", e.Context, e.Err)
 }
 
 // buildFixPrompt constructs the prompt sent to the AI fixer.
@@ -333,7 +295,16 @@ func buildFixPrompt(findings []types.Finding, repoRoot string, lspEnabled bool) 
 
 	// Embed current file contents so the fixer has the real code, not
 	// just the review diff which may be stale if other fixes ran first.
-	if contents := collectFixFileContents(repoRoot, findings); len(contents) > 0 {
+	// Collect unique file paths from findings, then read with traversal guard.
+	var relPaths []string
+	seen := make(map[string]bool)
+	for _, f := range findings {
+		if f.File != "" && !seen[f.File] {
+			seen[f.File] = true
+			relPaths = append(relPaths, f.File)
+		}
+	}
+	if contents := git.ReadFileContents(repoRoot, relPaths); len(contents) > 0 {
 		sb.WriteString("## Current File Contents\n")
 		sb.WriteString("Use these as the authoritative source of truth when applying fixes.\n\n")
 		paths := make([]string, 0, len(contents))
@@ -362,56 +333,18 @@ func buildFixPrompt(findings []types.Finding, repoRoot string, lspEnabled bool) 
 	return sb.String()
 }
 
-// collectFixFileContents reads the current on-disk content of every unique
-// file referenced in findings. Paths are validated to stay within repoRoot
-// (guards against model-produced absolute paths or ../ traversal).
-// Missing, unreadable, or out-of-bounds files are silently skipped.
-func collectFixFileContents(repoRoot string, findings []types.Finding) map[string]string {
-	seen := make(map[string]bool)
-	contents := make(map[string]string)
-	for _, f := range findings {
-		if f.File == "" || seen[f.File] {
-			continue
-		}
-		seen[f.File] = true
-		clean := filepath.Clean(f.File)
-		if filepath.IsAbs(clean) {
-			continue
-		}
-		repoAbs, err := filepath.Abs(repoRoot)
-		if err != nil {
-			continue
-		}
-		abs := filepath.Join(repoAbs, clean)
-		// Resolve symlinks so a symlink pointing outside repoRoot is caught.
-		resolved, err := filepath.EvalSymlinks(abs)
-		if err != nil {
-			continue
-		}
-		rel, err := filepath.Rel(repoAbs, resolved)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			continue
-		}
-		data, err := os.ReadFile(resolved)
-		if err != nil {
-			continue
-		}
-		contents[f.File] = string(data)
-	}
-	return contents
-}
 
 func applyFixPrompt(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, prompt string) (fixApplyResult, error) {
 	beforeStatus, err := git.StatusSnapshot(repoRoot)
 	if err != nil {
-		return fixApplyResult{}, runFixError{Context: "Fix status snapshot error", Err: err}
+		return fixApplyResult{}, fmt.Errorf("fix status snapshot error: %w", err)
 	}
 	if _, err := streamSession(client, ctx, repoRoot, selected, prompt, os.Stdout); err != nil {
-		return fixApplyResult{}, runFixError{Context: "Fix session error", Err: err}
+		return fixApplyResult{}, fmt.Errorf("fix session error: %w", err)
 	}
 	afterStatus, err := git.StatusSnapshot(repoRoot)
 	if err != nil {
-		return fixApplyResult{}, runFixError{Context: "Fix status snapshot error", Err: err}
+		return fixApplyResult{}, fmt.Errorf("fix status snapshot error: %w", err)
 	}
 	stagePaths := git.FixerStagePaths(beforeStatus, afterStatus)
 	if len(stagePaths) == 0 {
@@ -420,50 +353,3 @@ func applyFixPrompt(client *sdk.Client, ctx context.Context, repoRoot string, se
 	return fixApplyResult{Outcome: fixApplyChanged, StagePaths: stagePaths}, nil
 }
 
-func stageCommitPushFixes(repoRoot string, findings []types.Finding, iteration int, stagePaths []string, validator FixValidator) (fixPersistResult, error) {
-	var validPaths []string
-	for _, p := range stagePaths {
-		abs := filepath.Join(repoRoot, p)
-		if _, err := os.Stat(abs); err == nil {
-			validPaths = append(validPaths, p)
-		} else {
-			fmt.Fprintf(os.Stderr, "  Warning: skipping invalid stage path %q: %v\n", p, err)
-		}
-	}
-	if len(validPaths) == 0 {
-		fmt.Println("  (no valid paths to stage after fix)")
-		return fixPersistResult{Outcome: fixPersistNoop}, nil
-	}
-	addArgs := append([]string{"add", "-u", "--"}, validPaths...)
-	if _, err := git.Run(repoRoot, addArgs...); err != nil {
-		return fixPersistResult{}, runFixError{Context: "  git add failed", Err: err}
-	}
-	stagedArgs := append([]string{"diff", "--cached", "--name-only", "--"}, validPaths...)
-	staged, _ := git.Run(repoRoot, stagedArgs...)
-	if staged == "" {
-		fmt.Println("  (no file changes detected after fix)")
-		return fixPersistResult{Outcome: fixPersistNoop}, nil
-	}
-	if validator == nil {
-		validator = NewGoBuildFixValidator()
-	}
-	if err := validator.Validate(repoRoot, validPaths); err != nil {
-		restoreArgs := append([]string{"restore", "--staged", "--worktree", "--"}, validPaths...)
-		_, _ = git.Run(repoRoot, restoreArgs...)
-		return fixPersistResult{}, runFixError{Context: "  validation failed after fix — reverted fix paths", Err: err}
-	}
-
-	msg := fmt.Sprintf("fix: auto-fix %d finding(s) from review iteration %d", len(findings), iteration)
-	commitArgs := append([]string{"commit", "-m", msg, "--"}, validPaths...)
-	if _, err := git.Run(repoRoot, commitArgs...); err != nil {
-		return fixPersistResult{}, runFixError{Context: "  git commit failed", Err: err}
-	}
-	branch, err := git.Run(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil {
-		return fixPersistResult{}, runFixError{Context: "  git branch resolution failed", Err: err}
-	}
-	if _, err := git.Run(repoRoot, "push", "origin", branch); err != nil {
-		return fixPersistResult{}, runFixError{Context: "  git push failed", Err: err}
-	}
-	return fixPersistResult{Outcome: fixPersistCommitted, CommitMessage: msg}, nil
-}

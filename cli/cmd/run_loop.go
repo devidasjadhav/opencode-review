@@ -14,11 +14,24 @@ import (
 	"github.com/talk/opencode-client/internal/types"
 )
 
+// StepSignal is the control-flow value returned by every LoopStep.
+type StepSignal int
+
+const (
+	// SignalStop ends the run after the current iteration completes.
+	SignalStop StepSignal = iota
+	// SignalContinue lets the iteration finish all steps, then starts a new one.
+	SignalContinue
+	// SignalRestartNow skips all remaining steps and begins a new iteration immediately.
+	SignalRestartNow
+)
+
 type iterationResult struct {
 	hash       string
 	subject    string
 	reviewText string
 	verdict    string
+	findings   []types.Finding // parsed once in reviewStep; consumed by later steps
 }
 
 func executeReviewLoop(env runEnvironment, ghCtx githubContext, selected, verifier types.ModelInfo, cfg runConfig, summary *RunSummary) error {
@@ -34,8 +47,12 @@ func executeReviewLoop(env runEnvironment, ghCtx githubContext, selected, verifi
 	return runner.Run()
 }
 
+// LoopStep is one stage in the review/fix/merge loop.
+// Returning SignalRestartNow skips all remaining steps in the iteration.
+// Returning SignalContinue marks the iteration as "keep looping" but still runs subsequent steps.
+// Returning SignalStop (or any step returning Stop while no other step returned Continue) ends the run.
 type LoopStep interface {
-	Run(state *loopState) (continueLoop bool, err error)
+	Run(state *loopState) (StepSignal, error)
 }
 
 type loopState struct {
@@ -52,7 +69,6 @@ type loopState struct {
 	// Steps execute sequentially in a single goroutine — no synchronisation needed.
 	changedFiles map[string]bool
 	lastFixPaths []string
-	stop         bool
 }
 
 type loopRunner struct {
@@ -67,25 +83,27 @@ func newLoopRunner(env runEnvironment, ghCtx githubContext, selected, verifier t
 	}
 }
 
+// Run executes all steps sequentially each iteration.
+// SignalRestartNow is the only signal that short-circuits remaining steps.
+// SignalContinue from any step causes another full iteration after all steps complete.
 func (r *loopRunner) Run() error {
 	for {
 		r.state.iteration++
-		r.state.stop = false
-		continueLoop := false
+		finalSignal := SignalStop
 		for _, step := range r.steps {
-			stepContinue, err := step.Run(&r.state)
+			sig, err := step.Run(&r.state)
 			if err != nil {
 				return err
 			}
-			if r.state.stop {
-				return nil
-			}
-			if stepContinue {
-				continueLoop = true
+			if sig == SignalRestartNow {
+				finalSignal = SignalRestartNow
 				break
 			}
+			if sig == SignalContinue {
+				finalSignal = SignalContinue
+			}
 		}
-		if !continueLoop {
+		if finalSignal == SignalStop {
 			return nil
 		}
 	}
@@ -93,20 +111,20 @@ func (r *loopRunner) Run() error {
 
 type reviewStep struct{}
 
-func (reviewStep) Run(state *loopState) (bool, error) {
+func (reviewStep) Run(state *loopState) (StepSignal, error) {
 	result, err := runReviewIteration(state.env, state.ghCtx, state.selected, state.cfg, state.iteration, state.changedFiles)
 	if err != nil {
-		return false, err
+		return SignalStop, err
 	}
 	state.result = result
 	state.summary.iterations++
 	state.summary.finalVerdict = result.verdict
-	return false, nil
+	return SignalStop, nil
 }
 
 type postReviewStep struct{}
 
-func (postReviewStep) Run(state *loopState) (bool, error) {
+func (postReviewStep) Run(state *loopState) (StepSignal, error) {
 	postPRReviewIfRequested(state.env.ctx, state.ghCtx, state.cfg, state.result.reviewText, state.result.verdict)
 	logEvent(state.env.log, map[string]any{
 		"event":     "review_iteration",
@@ -115,86 +133,84 @@ func (postReviewStep) Run(state *loopState) (bool, error) {
 		"subject":   state.result.subject,
 		"verdict":   state.result.verdict,
 	})
-	return false, nil
+	return SignalStop, nil
 }
 
 type issueStep struct{}
 
-func (issueStep) Run(state *loopState) (bool, error) {
+func (issueStep) Run(state *loopState) (StepSignal, error) {
 	if !state.cfg.createIssues || state.result.reviewText == "" {
-		return false, nil
+		return SignalStop, nil
 	}
 	before := len(state.openIssues)
 	openIssues, err := fileIssues(state.env.ctx, state.ghCtx.gh, state.ghCtx.prNum, state.result.reviewText, state.openIssues, state.env.log)
 	if err != nil {
-		return false, err
+		return SignalStop, err
 	}
 	state.summary.issuesCreated += len(openIssues) - before
 	state.openIssues = openIssues
-	return false, nil
+	return SignalStop, nil
 }
 
 type mergeStep struct{}
 
-func (mergeStep) Run(state *loopState) (bool, error) {
+func (mergeStep) Run(state *loopState) (StepSignal, error) {
 	fmt.Printf("\nVerdict: %s\n", state.result.verdict)
 	if !state.cfg.loopMode {
-		state.stop = true
-		return false, nil
+		return SignalStop, nil
 	}
 	merged, err := maybeMergeOnApprove(state.env, state.ghCtx, state.cfg, state.result, state.openIssues)
 	if err != nil {
-		return false, err
+		return SignalStop, err
 	}
 	if merged {
-		state.stop = true
-		return false, nil
+		return SignalStop, nil
 	}
 	if state.cfg.mergeOnApprove && !state.cfg.autoFix && !canMergeOnApprove(state.cfg, state.result.verdict) {
-		state.stop = true
+		return SignalStop, nil
 	}
-	return false, nil
+	return SignalStop, nil
 }
 
 type autoFixStep struct{}
 
-func (autoFixStep) Run(state *loopState) (bool, error) {
+func (autoFixStep) Run(state *loopState) (StepSignal, error) {
 	state.lastFixPaths = nil
 	if !state.cfg.autoFix {
-		return false, nil
+		return SignalStop, nil
 	}
-	findings := review.ParseFindings(state.result.reviewText)
-	fixable := filterFixableFindings(findings, state.cfg.minConfidence)
-	if len(findings) > 0 && len(fixable) == 0 {
+	fixable := filterFixableFindings(state.result.findings, state.cfg.minConfidence)
+	if len(state.result.findings) > 0 && len(fixable) == 0 {
 		fmt.Fprintln(os.Stderr, "\nAuto-fix: no fixable findings at required confidence — cannot auto-fix. Manual intervention required.")
-		state.stop = true
-		return false, nil
+		return SignalStop, nil
 	}
-	cont, changedPaths, err := runAutoFixIfNeeded(state.env, state.selected, state.cfg, state.result.reviewText, state.iteration)
+	cont, changedPaths, err := runAutoFixIfNeeded(state.env, state.selected, state.cfg, state.result.findings, state.iteration)
 	if err != nil {
-		return false, err
+		return SignalStop, err
 	}
 	if len(changedPaths) > 0 {
 		state.changedFiles = pathsToRelMap(changedPaths, state.env.repoRoot)
 		state.lastFixPaths = changedPaths
 		state.summary.fixesApplied++
 	}
-	return cont, nil
+	if cont {
+		return SignalContinue, nil
+	}
+	return SignalStop, nil
 }
 
 type verifyFixStep struct{}
 
-func (verifyFixStep) Run(state *loopState) (bool, error) {
+func (verifyFixStep) Run(state *loopState) (StepSignal, error) {
 	if state.verifier.ModelID == "" || len(state.lastFixPaths) == 0 {
-		return false, nil
+		return SignalStop, nil
 	}
 	diff, err := git.DiffHead(state.env.repoRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nVerifier: could not get diff: %v — skipping verification\n", err)
-		return false, nil
+		return SignalStop, nil
 	}
-	findings := review.ParseFindings(state.result.reviewText)
-	fixable := filterFixableFindings(findings, state.cfg.minConfidence)
+	fixable := filterFixableFindings(state.result.findings, state.cfg.minConfidence)
 	prompt := review.BuildVerifyPrompt(diff, buildFindingSummary(fixable))
 
 	fmt.Println("\n--- Independent Verification ---")
@@ -213,32 +229,32 @@ func (verifyFixStep) Run(state *loopState) (bool, error) {
 
 	if verdict == "PASS" {
 		fmt.Println("\nVerification: PASS — fix accepted.")
-		return false, nil
+		return SignalStop, nil
 	}
 
 	fmt.Fprintln(os.Stderr, "\nVerification: FAIL — reverting fix commit.")
 	if err := git.RevertHead(state.env.repoRoot); err != nil {
-		return false, fmt.Errorf("verifier: revert failed: %w", err)
+		return SignalStop, fmt.Errorf("verifier: revert failed: %w", err)
 	}
 	logEvent(state.env.log, map[string]any{"event": "verify_fix_reverted", "iteration": state.iteration})
 	state.summary.fixesReverted++
 	state.lastFixPaths = nil
 	state.changedFiles = nil
-	return true, nil
+	// Restart immediately — skip the wait interval when a fix was just reverted.
+	return SignalRestartNow, nil
 }
 
 type waitStep struct{}
 
-func (waitStep) Run(state *loopState) (bool, error) {
-	if !state.cfg.loopMode || state.stop {
-		state.stop = true
-		return false, nil
+func (waitStep) Run(state *loopState) (StepSignal, error) {
+	if !state.cfg.loopMode {
+		return SignalStop, nil
 	}
 	if state.cfg.loopInterval > 0 {
 		fmt.Printf("\nWaiting %s for fixes before next review...\n", state.cfg.loopInterval)
 		time.Sleep(state.cfg.loopInterval)
 	}
-	return true, nil
+	return SignalContinue, nil
 }
 
 func runReviewIteration(env runEnvironment, ghCtx githubContext, selected types.ModelInfo, cfg runConfig, iteration int, changedFiles map[string]bool) (iterationResult, error) {
@@ -275,6 +291,7 @@ func runReviewIteration(env runEnvironment, ghCtx githubContext, selected types.
 		subject:    subject,
 		reviewText: reviewText,
 		verdict:    review.ExtractVerdict(reviewText),
+		findings:   review.ParseFindings(reviewText), // parsed once here
 	}, nil
 }
 
@@ -285,7 +302,7 @@ func buildReviewContext(env runEnvironment, ghCtx githubContext, cfg runConfig, 
 
 	// Embed full content of every file touched by this commit.
 	if files, err := git.DiffChangedFiles(env.repoRoot, hash); err == nil && len(files) > 0 {
-		rctx.ChangedFiles = readFileContents(env.repoRoot, files)
+		rctx.ChangedFiles = git.ReadFileContents(env.repoRoot, files)
 	}
 
 	// Tell the model which issues are already tracked so it doesn't re-report them.
@@ -299,24 +316,10 @@ func buildReviewContext(env runEnvironment, ghCtx githubContext, cfg runConfig, 
 	return rctx
 }
 
-// readFileContents reads the current on-disk content of each repo-relative path.
-func readFileContents(repoRoot string, relPaths []string) map[string]string {
-	m := make(map[string]string, len(relPaths))
-	for _, p := range relPaths {
-		data, err := os.ReadFile(filepath.Join(repoRoot, p))
-		if err != nil {
-			continue
-		}
-		m[p] = string(data)
-	}
-	return m
-}
-
-func runAutoFixIfNeeded(env runEnvironment, selected types.ModelInfo, cfg runConfig, reviewText string, iteration int) (bool, []string, error) {
+func runAutoFixIfNeeded(env runEnvironment, selected types.ModelInfo, cfg runConfig, findings []types.Finding, iteration int) (bool, []string, error) {
 	if !cfg.autoFix {
 		return false, nil, nil
 	}
-	findings := review.ParseFindings(reviewText)
 	fixable := filterFixableFindings(findings, cfg.minConfidence)
 	if len(fixable) == 0 {
 		return false, nil, nil

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	gogithub "github.com/google/go-github/v67/github"
 )
@@ -67,6 +68,22 @@ func IsWarning(err error) bool {
 		return ae.Kind == KindWarning
 	}
 	return false
+}
+
+// ClassifyOpencode classifies errors from the opencode SDK/server.
+// Connection and availability errors are transient; everything else is permanent.
+func ClassifyOpencode(err error) *AppError {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "unavailable") ||
+		strings.Contains(msg, "eof") {
+		return Transient("opencode", err)
+	}
+	return Permanent("opencode", err)
 }
 
 // ClassifyGitHub inspects a GitHub API error and returns an AppError with the

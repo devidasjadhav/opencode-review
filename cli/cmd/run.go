@@ -61,7 +61,8 @@ func run() error {
 		return err
 	}
 	defer env.log.Close()
-	if err := mustCreateFixBranchIfRequested(env.repoRoot, &cfg); err != nil {
+	cfg, err = mustCreateFixBranchIfRequested(env.repoRoot, cfg)
+	if err != nil {
 		return err
 	}
 	ghCtx, err := initGitHubContext(env, cfg)

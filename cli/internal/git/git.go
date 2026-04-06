@@ -142,6 +142,30 @@ func DiffChangedFiles(root, ref string) ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
+// ReadFileContents reads the current on-disk content of each repo-relative path.
+// Paths that escape the repo root via symlinks or ".." are silently skipped.
+func ReadFileContents(repoRoot string, relPaths []string) map[string]string {
+	m := make(map[string]string, len(relPaths))
+	rootWithSep := repoRoot + string(filepath.Separator)
+	for _, p := range relPaths {
+		abs := filepath.Join(repoRoot, p)
+		// Resolve symlinks so we can enforce the boundary check.
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			resolved = abs
+		}
+		if resolved != repoRoot && !strings.HasPrefix(resolved, rootWithSep) {
+			continue // path traversal — skip
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			continue
+		}
+		m[p] = string(data)
+	}
+	return m
+}
+
 func FixerStagePaths(before, after map[string]StatusSnapshotEntry) []string {
 	var paths []string
 	for path, afterStatus := range after {

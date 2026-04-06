@@ -4,6 +4,7 @@ import (
 	"context"
 
 	gogithub "github.com/google/go-github/v67/github"
+	"github.com/talk/opencode-client/internal/apperr"
 	"github.com/talk/opencode-client/internal/types"
 )
 
@@ -29,7 +30,11 @@ func (c *RealClient) EnsureOpenPR(ctx context.Context, repoRoot, baseBranch stri
 }
 
 func (c *RealClient) PostPRReview(ctx context.Context, prNum int, body, verdict string) error {
-	return PostPRReview(ctx, c.client, c.owner, c.repo, prNum, body, verdict)
+	err := PostPRReview(ctx, c.client, c.owner, c.repo, prNum, body, verdict)
+	if err != nil {
+		return apperr.ClassifyGitHub("post PR review", err)
+	}
+	return nil
 }
 
 func (c *RealClient) ValidateIssues(ctx context.Context, repoRoot string) ([]IssueValidity, error) {
@@ -40,23 +45,42 @@ func (c *RealClient) FetchIssueIndex(ctx context.Context) (IssueIndex, error) {
 	return BuildIssueIndex(ctx, c.client, c.owner, c.repo)
 }
 
-
 func (c *RealClient) CreateIssue(ctx context.Context, f types.Finding) (int, error) {
-	return CreateIssue(ctx, c.client, c.owner, c.repo, f)
+	num, err := CreateIssue(ctx, c.client, c.owner, c.repo, f)
+	if err != nil {
+		return 0, apperr.ClassifyGitHub("create issue", err)
+	}
+	return num, nil
 }
 
 func (c *RealClient) CommentOnIssue(ctx context.Context, issueNum int, body string) error {
-	return CommentOnIssue(ctx, c.client, c.owner, c.repo, issueNum, body)
+	err := CommentOnIssue(ctx, c.client, c.owner, c.repo, issueNum, body)
+	if err != nil {
+		return apperr.ClassifyGitHub("comment on issue", err)
+	}
+	return nil
 }
 
 func (c *RealClient) CloseIssue(ctx context.Context, issueNum int) error {
-	return CloseIssue(ctx, c.client, c.owner, c.repo, issueNum)
+	err := CloseIssue(ctx, c.client, c.owner, c.repo, issueNum)
+	if err != nil {
+		return apperr.ClassifyGitHub("close issue", err)
+	}
+	return nil
 }
 
 func (c *RealClient) LinkIssuesToPR(ctx context.Context, prNum int, issueNums []int) error {
-	return LinkIssuesToPR(ctx, c.client, c.owner, c.repo, prNum, issueNums)
+	err := LinkIssuesToPR(ctx, c.client, c.owner, c.repo, prNum, issueNums)
+	if err != nil {
+		return apperr.ClassifyGitHub("link issues to PR", err)
+	}
+	return nil
 }
 
 func (c *RealClient) MergePR(ctx context.Context, prNum int, strategy string, deleteBranch bool) error {
-	return MergePR(ctx, c.client, c.owner, c.repo, prNum, strategy, deleteBranch)
+	err := MergePR(ctx, c.client, c.owner, c.repo, prNum, strategy, deleteBranch)
+	if err != nil {
+		return apperr.ClassifyGitHub("merge PR", err)
+	}
+	return nil
 }

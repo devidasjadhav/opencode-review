@@ -13,15 +13,20 @@ type PRPort interface {
 	MergePR(ctx context.Context, prNum int, strategy string, deleteBranch bool) error
 }
 
-// ValidationPort covers open-issue validation and stale-issue reconciliation.
-type ValidationPort interface {
-	ValidateIssues(ctx context.Context, repoRoot string) ([]IssueValidity, error)
+// IssueCloserPort is the minimal interface for closing and commenting on issues.
+// It is embedded by ValidationPort and used directly by close/reconcile functions.
+type IssueCloserPort interface {
 	CommentOnIssue(ctx context.Context, issueNum int, body string) error
 	CloseIssue(ctx context.Context, issueNum int) error
 }
 
+// ValidationPort covers open-issue validation and stale-issue reconciliation.
+type ValidationPort interface {
+	IssueCloserPort
+	ValidateIssues(ctx context.Context, repoRoot string) ([]IssueValidity, error)
+}
+
 // IssueFilerPort covers finding-to-issue filing and PR linking.
-// Closing issues uses the narrower issueCloser interface in cmd/.
 type IssueFilerPort interface {
 	FetchIssueIndex(ctx context.Context) (IssueIndex, error)
 	CreateIssue(ctx context.Context, f types.Finding) (int, error)
