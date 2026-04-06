@@ -40,17 +40,6 @@ func (NoOpClient) FetchIssueIndex(_ context.Context) (IssueIndex, error) {
 	}, nil
 }
 
-func (NoOpClient) ExistingIssueTitles(_ context.Context) (map[string]bool, error) {
-	return map[string]bool{}, nil
-}
-
-func (NoOpClient) ExistingFingerprints(_ context.Context) (map[string]int, error) {
-	return map[string]int{}, nil
-}
-
-func (NoOpClient) ListOpenIssueSummaries(_ context.Context) ([]types.IssueSummary, error) {
-	return nil, nil
-}
 
 func (NoOpClient) CreateIssue(_ context.Context, f types.Finding) (int, error) {
 	fmt.Printf("[dry-run] Would create issue: [%s] %s:%s — %s\n", f.Severity, f.File, f.LineRange, f.Title)

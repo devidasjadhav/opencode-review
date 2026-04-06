@@ -264,7 +264,7 @@ func verifyReviewedHead(repoRoot, hash string) error {
 	return nil
 }
 
-func closeRunIssues(ctx context.Context, port gh.IssueFilerPort, openIssues []int, log *logger.Logger) error {
+func closeRunIssues(ctx context.Context, port issueCloser, openIssues []int, log *logger.Logger) error {
 	closeNums := map[int]bool{}
 	for _, n := range openIssues {
 		closeNums[n] = true

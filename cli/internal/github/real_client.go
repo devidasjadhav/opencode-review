@@ -40,17 +40,6 @@ func (c *RealClient) FetchIssueIndex(ctx context.Context) (IssueIndex, error) {
 	return BuildIssueIndex(ctx, c.client, c.owner, c.repo)
 }
 
-func (c *RealClient) ExistingIssueTitles(ctx context.Context) (map[string]bool, error) {
-	return ExistingIssueTitles(ctx, c.client, c.owner, c.repo)
-}
-
-func (c *RealClient) ExistingFingerprints(ctx context.Context) (map[string]int, error) {
-	return ExistingFingerprints(ctx, c.client, c.owner, c.repo)
-}
-
-func (c *RealClient) ListOpenIssueSummaries(ctx context.Context) ([]types.IssueSummary, error) {
-	return ListOpenIssueSummaries(ctx, c.client, c.owner, c.repo)
-}
 
 func (c *RealClient) CreateIssue(ctx context.Context, f types.Finding) (int, error) {
 	return CreateIssue(ctx, c.client, c.owner, c.repo, f)

@@ -164,14 +164,36 @@ func CreateIssue(ctx context.Context, gh *gogithub.Client, owner, repo string, f
 	}
 
 	bodyStr := body.String()
+	labels := issueLabels(f.Severity)
 	issue, _, err := gh.Issues.Create(ctx, owner, repo, &gogithub.IssueRequest{
-		Title: &title,
-		Body:  &bodyStr,
+		Title:  &title,
+		Body:   &bodyStr,
+		Labels: &labels,
 	})
 	if err != nil {
 		return 0, err
 	}
 	return issue.GetNumber(), nil
+}
+
+// issueLabels returns GitHub labels for a finding based on its severity.
+// "code-review" is always included so all opencode-review issues are filterable.
+// Severity maps to the corresponding severity label plus a type label:
+//
+//	Critical/High → bug
+//	Medium        → enhancement
+//	Low           → good first issue
+func issueLabels(severity string) []string {
+	labels := []string{"code-review", strings.ToLower(severity)}
+	switch strings.ToLower(severity) {
+	case "critical", "high":
+		labels = append(labels, "bug")
+	case "medium":
+		labels = append(labels, "enhancement")
+	case "low":
+		labels = append(labels, "good first issue")
+	}
+	return labels
 }
 
 // CloseIssue closes issue state only.

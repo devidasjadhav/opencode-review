@@ -36,8 +36,4 @@ type Port interface {
 	PRPort
 	ValidationPort
 	IssueFilerPort
-	// Legacy helpers retained for backward compatibility with RealClient/NoOpClient.
-	ExistingIssueTitles(ctx context.Context) (map[string]bool, error)
-	ExistingFingerprints(ctx context.Context) (map[string]int, error)
-	ListOpenIssueSummaries(ctx context.Context) ([]types.IssueSummary, error)
 }

@@ -27,15 +27,6 @@ func (m *mockGitHub) ValidateIssues(_ context.Context, _ string) ([]gh.IssueVali
 func (m *mockGitHub) FetchIssueIndex(_ context.Context) (gh.IssueIndex, error) {
 	return gh.IssueIndex{Titles: map[string]bool{}, Fingerprints: map[string]int{}}, nil
 }
-func (m *mockGitHub) ExistingIssueTitles(_ context.Context) (map[string]bool, error) {
-	return map[string]bool{}, nil
-}
-func (m *mockGitHub) ExistingFingerprints(_ context.Context) (map[string]int, error) {
-	return map[string]int{}, nil
-}
-func (m *mockGitHub) ListOpenIssueSummaries(_ context.Context) ([]types.IssueSummary, error) {
-	return nil, nil
-}
 func (m *mockGitHub) CreateIssue(_ context.Context, _ types.Finding) (int, error) { return 0, nil }
 func (m *mockGitHub) CommentOnIssue(_ context.Context, _ int, _ string) error     { return nil }
 func (m *mockGitHub) CloseIssue(_ context.Context, _ int) error                   { return nil }
