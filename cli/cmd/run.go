@@ -79,7 +79,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	return executeReviewLoop(env, ghCtx, selected, verifier, cfg)
+	summary := newRunSummary()
+	loopErr := executeReviewLoop(env, ghCtx, selected, verifier, cfg, summary)
+	summary.print(env.log.LogPath())
+	return loopErr
 }
 
 func parseFlags() runConfig {

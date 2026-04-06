@@ -21,8 +21,8 @@ type iterationResult struct {
 	verdict    string
 }
 
-func executeReviewLoop(env runEnvironment, ghCtx githubContext, selected, verifier types.ModelInfo, cfg runConfig) error {
-	runner := newLoopRunner(env, ghCtx, selected, verifier, cfg, []LoopStep{
+func executeReviewLoop(env runEnvironment, ghCtx githubContext, selected, verifier types.ModelInfo, cfg runConfig, summary *RunSummary) error {
+	runner := newLoopRunner(env, ghCtx, selected, verifier, cfg, summary, []LoopStep{
 		reviewStep{},
 		postReviewStep{},
 		issueStep{},
@@ -44,6 +44,7 @@ type loopState struct {
 	selected     types.ModelInfo
 	verifier     types.ModelInfo
 	cfg          runConfig
+	summary      *RunSummary
 	iteration    int
 	result       iterationResult
 	openIssues   []int
@@ -59,9 +60,9 @@ type loopRunner struct {
 	steps []LoopStep
 }
 
-func newLoopRunner(env runEnvironment, ghCtx githubContext, selected, verifier types.ModelInfo, cfg runConfig, steps []LoopStep) *loopRunner {
+func newLoopRunner(env runEnvironment, ghCtx githubContext, selected, verifier types.ModelInfo, cfg runConfig, summary *RunSummary, steps []LoopStep) *loopRunner {
 	return &loopRunner{
-		state: loopState{env: env, ghCtx: ghCtx, selected: selected, verifier: verifier, cfg: cfg},
+		state: loopState{env: env, ghCtx: ghCtx, selected: selected, verifier: verifier, cfg: cfg, summary: summary},
 		steps: steps,
 	}
 }
@@ -98,6 +99,8 @@ func (reviewStep) Run(state *loopState) (bool, error) {
 		return false, err
 	}
 	state.result = result
+	state.summary.iterations++
+	state.summary.finalVerdict = result.verdict
 	return false, nil
 }
 
@@ -121,10 +124,12 @@ func (issueStep) Run(state *loopState) (bool, error) {
 	if !state.cfg.createIssues || state.result.reviewText == "" {
 		return false, nil
 	}
+	before := len(state.openIssues)
 	openIssues, err := fileIssues(state.env.ctx, state.ghCtx.gh, state.ghCtx.prNum, state.result.reviewText, state.openIssues, state.env.log)
 	if err != nil {
 		return false, err
 	}
+	state.summary.issuesCreated += len(openIssues) - before
 	state.openIssues = openIssues
 	return false, nil
 }
@@ -172,6 +177,7 @@ func (autoFixStep) Run(state *loopState) (bool, error) {
 	if len(changedPaths) > 0 {
 		state.changedFiles = pathsToRelMap(changedPaths, state.env.repoRoot)
 		state.lastFixPaths = changedPaths
+		state.summary.fixesApplied++
 	}
 	return cont, nil
 }
@@ -215,6 +221,7 @@ func (verifyFixStep) Run(state *loopState) (bool, error) {
 		return false, fmt.Errorf("verifier: revert failed: %w", err)
 	}
 	logEvent(state.env.log, map[string]any{"event": "verify_fix_reverted", "iteration": state.iteration})
+	state.summary.fixesReverted++
 	state.lastFixPaths = nil
 	state.changedFiles = nil
 	return true, nil
@@ -316,7 +323,8 @@ func runAutoFixIfNeeded(env runEnvironment, selected types.ModelInfo, cfg runCon
 	fmt.Printf("\n--- Auto-fixing %d finding(s) ---\n", len(fixable))
 	n, changedPaths, err := occ.RunFix(env.client, env.ctx, env.repoRoot, selected, fixable, iteration, occ.NewGitFixPersister())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+		fmt.Fprintf(os.Stderr, "Warning: auto-fix failed: %v\n", err)
+		logEvent(env.log, map[string]any{"event": "auto_fix_error", "error": err.Error(), "iteration": iteration})
 		return false, nil, nil
 	}
 	logEvent(env.log, map[string]any{"event": "auto_fix", "findings_fixed": n})
