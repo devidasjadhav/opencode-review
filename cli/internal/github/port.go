@@ -21,12 +21,12 @@ type ValidationPort interface {
 }
 
 // IssueFilerPort covers finding-to-issue filing and PR linking.
+// Closing issues uses the narrower issueCloser interface in cmd/.
 type IssueFilerPort interface {
 	FetchIssueIndex(ctx context.Context) (IssueIndex, error)
 	CreateIssue(ctx context.Context, f types.Finding) (int, error)
 	CommentOnIssue(ctx context.Context, issueNum int, body string) error
 	LinkIssuesToPR(ctx context.Context, prNum int, issueNums []int) error
-	CloseIssue(ctx context.Context, issueNum int) error
 }
 
 // Port is the full GitHub interface used by githubContext.

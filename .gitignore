@@ -1,2 +1,4 @@
 cli/opencode-client
 logs/*
+*.env
+.opencode-review.env
