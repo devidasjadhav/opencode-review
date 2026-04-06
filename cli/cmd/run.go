@@ -30,6 +30,7 @@ type runConfig struct {
 	minConfidence    string
 	verifierModelNum int
 	dryRun           bool
+	lspEnabled       bool
 }
 
 func (c runConfig) needsGitHubClient() bool {
@@ -108,6 +109,7 @@ func parseFlags() runConfig {
 	minConfidence := flag.String("min-confidence", envOr(env, "MIN_CONFIDENCE", "MEDIUM"), "Minimum confidence level to auto-fix: HIGH, MEDIUM, or LOW")
 	verifierModelNum := flag.Int("verifier-model", envInt(env, "VERIFIER_MODEL", 0), "Model number to use as independent fix verifier (0 = disabled)")
 	dryRun := flag.Bool("dry-run", envBool(env, "DRY_RUN", false), "Print GitHub actions without executing them (no issues, no PR posts, no merges)")
+	lspEnabled := flag.Bool("lsp", envBool(env, "LSP", false), "Instruct the model to use LSP tools (goToDefinition, findReferences, hover) during review and fix sessions. Requires opencode started with OPENCODE_EXPERIMENTAL_LSP_TOOL=true")
 	flag.Parse()
 
 	return runConfig{
@@ -130,6 +132,7 @@ func parseFlags() runConfig {
 		minConfidence:    *minConfidence,
 		verifierModelNum: *verifierModelNum,
 		dryRun:           *dryRun,
+		lspEnabled:       *lspEnabled,
 	}
 }
 

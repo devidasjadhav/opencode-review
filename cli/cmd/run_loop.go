@@ -257,7 +257,7 @@ func runReviewIteration(env runEnvironment, ghCtx githubContext, selected types.
 
 	var prompt string
 	if cfg.auditMode {
-		prompt, err = review.BuildAuditPrompt(env.repoRoot, changedFiles)
+		prompt, err = review.BuildAuditPrompt(env.repoRoot, changedFiles, cfg.lspEnabled)
 		if err != nil {
 			return iterationResult{}, wrapErr("Audit prompt error", err)
 		}
@@ -295,6 +295,7 @@ func buildReviewContext(env runEnvironment, ghCtx githubContext, cfg runConfig, 
 		}
 	}
 
+	rctx.LSPEnabled = cfg.lspEnabled
 	return rctx
 }
 
@@ -321,7 +322,7 @@ func runAutoFixIfNeeded(env runEnvironment, selected types.ModelInfo, cfg runCon
 		return false, nil, nil
 	}
 	fmt.Printf("\n--- Auto-fixing %d finding(s) ---\n", len(fixable))
-	n, changedPaths, err := occ.RunFix(env.client, env.ctx, env.repoRoot, selected, fixable, iteration, occ.NewGitFixPersister())
+	n, changedPaths, err := occ.RunFix(env.client, env.ctx, env.repoRoot, selected, fixable, iteration, occ.NewGitFixPersister(), cfg.lspEnabled)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: auto-fix failed: %v\n", err)
 		logEvent(env.log, map[string]any{"event": "auto_fix_error", "error": err.Error(), "iteration": iteration})

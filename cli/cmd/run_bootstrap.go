@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	sdk "github.com/sst/opencode-sdk-go"
@@ -41,12 +42,30 @@ func initEnvironment(cfg runConfig) (runEnvironment, error) {
 	if err != nil {
 		return runEnvironment{}, wrapErr("", err)
 	}
+	if cfg.lspEnabled {
+		checkLSPEnvironment()
+	}
 	return runEnvironment{
 		ctx:      context.Background(),
 		repoRoot: repoRoot,
 		client:   occ.NewClient(cfg.serverURL),
 		log:      logger.New(repoRoot),
 	}, nil
+}
+
+// checkLSPEnvironment warns when --lsp is requested but the opencode server
+// was likely not started with LSP tool support enabled.
+func checkLSPEnvironment() {
+	lspVars := []string{"OPENCODE_EXPERIMENTAL_LSP_TOOL", "OPENCODE_EXPERIMENTAL"}
+	for _, v := range lspVars {
+		if strings.EqualFold(os.Getenv(v), "true") || os.Getenv(v) == "1" {
+			fmt.Printf("LSP: tools enabled via %s=true\n", v)
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, "Warning: --lsp requested but neither OPENCODE_EXPERIMENTAL_LSP_TOOL nor OPENCODE_EXPERIMENTAL is set.")
+	fmt.Fprintln(os.Stderr, "  Start opencode with OPENCODE_EXPERIMENTAL_LSP_TOOL=true for LSP tools to be available.")
+	fmt.Fprintln(os.Stderr, "  Proceeding — model will attempt to use LSP tools but they may not be available.")
 }
 
 func mustCreateFixBranchIfRequested(repoRoot string, cfg *runConfig) error {

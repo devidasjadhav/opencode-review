@@ -23,6 +23,27 @@ type ReviewContext struct {
 	// ExistingIssues lists open GitHub issues already tracking findings.
 	// The model is instructed not to re-report these.
 	ExistingIssues []types.IssueSummary
+	// LSPEnabled instructs the model to use LSP navigation tools before
+	// reporting findings. Only effective when opencode is started with
+	// OPENCODE_EXPERIMENTAL_LSP_TOOL=true.
+	LSPEnabled bool
+}
+
+// lspPreamble returns the LSP usage instruction block for prompts.
+// The model is explicitly told which tools to call and when, so it navigates
+// the codebase instead of guessing at types and call sites.
+func lspPreamble() string {
+	return `## LSP Navigation — Use Before Reporting Findings
+You have access to LSP (Language Server Protocol) tools. Use them BEFORE filing any finding:
+- **goToDefinition** — verify a symbol's definition before claiming a type contract is violated
+- **findReferences** — confirm a function/type is actually duplicated before flagging DRY violations
+- **hover** — check the inferred type of an expression before flagging a type mismatch
+- **goToImplementation** — check all concrete implementations of an interface before flagging ISP violations
+- **workspaceSymbol** — search for existing helpers before flagging that one should be extracted
+
+Do NOT report a finding if LSP navigation shows your assumption is wrong.
+
+`
 }
 
 func findingsFormat(sb *strings.Builder) {
@@ -76,6 +97,9 @@ func ExtractVerifyVerdict(text string) string {
 // model has real context rather than only the diff.
 func BuildReviewPrompt(hash, subject, body, diff string, rctx ReviewContext) string {
 	var sb strings.Builder
+	if rctx.LSPEnabled {
+		sb.WriteString(lspPreamble())
+	}
 	sb.WriteString("Review the following git commit for correctness, SOLID, and DRY violations.\n")
 	sb.WriteString("The full current content of every changed file is provided below the diff.\n")
 	sb.WriteString("Use those file contents — not just the diff hunks — to understand types, imports, and call sites.\n\n")
@@ -160,10 +184,15 @@ type auditFile struct {
 // files (relative to repoRoot). Pass nil for a full first-iteration audit.
 // Files are sorted by modification time (most recent first) and embedded until
 // the context budget is reached; a note is added when files are omitted.
-func BuildAuditPrompt(repoRoot string, changedFiles map[string]bool) (string, error) {
+// BuildAuditPrompt builds a full SOLID/DRY audit prompt.
+// lspEnabled instructs the model to use LSP tools before reporting findings.
+func BuildAuditPrompt(repoRoot string, changedFiles map[string]bool, lspEnabled bool) (string, error) {
 	lang := langdetect.Detect(repoRoot)
 
 	var sb strings.Builder
+	if lspEnabled {
+		sb.WriteString(lspPreamble())
+	}
 	fmt.Fprintf(&sb, "Perform a SOLID and DRY audit of the %s files provided below.\n", lang.Name)
 	if len(changedFiles) > 0 {
 		sb.WriteString("Note: Only showing files changed since last audit. Unchanged files have already been reviewed.\n\n")

@@ -248,14 +248,14 @@ func (p gitFixPersister) Persist(repoRoot string, findings []types.Finding, iter
 	return stageCommitPushFixes(repoRoot, findings, iteration, stagePaths, p.validator)
 }
 
-func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int, persister FixPersister) (int, []string, error) {
+func RunFix(client *sdk.Client, ctx context.Context, repoRoot string, selected types.ModelInfo, findings []types.Finding, iteration int, persister FixPersister, lspEnabled bool) (int, []string, error) {
 	if len(findings) == 0 {
 		return 0, nil, nil
 	}
 	if persister == nil {
 		persister = NewGitFixPersister()
 	}
-	prompt := buildFixPrompt(findings, repoRoot)
+	prompt := buildFixPrompt(findings, repoRoot, lspEnabled)
 	applyResult, err := applyFixPrompt(client, ctx, repoRoot, selected, prompt)
 	if err != nil {
 		return 0, nil, err
@@ -318,8 +318,14 @@ func (e runFixError) Error() string {
 // repoRoot is used to read the current on-disk content of each file
 // referenced in findings so the model works from accurate code, not
 // a potentially stale mental model built from the original review diff.
-func buildFixPrompt(findings []types.Finding, repoRoot string) string {
+func buildFixPrompt(findings []types.Finding, repoRoot string, lspEnabled bool) string {
 	var sb strings.Builder
+	if lspEnabled {
+		sb.WriteString("You have access to LSP tools. Before writing any fix, use:\n")
+		sb.WriteString("- **hover** to confirm the exact type of any expression you are changing\n")
+		sb.WriteString("- **goToDefinition** to read the full definition of any symbol you reference\n")
+		sb.WriteString("- **findReferences** to ensure your change does not break other call sites\n\n")
+	}
 	fmt.Fprintf(&sb, "You are an automated code fixer. Apply ALL of the following fixes to the codebase.\n")
 	fmt.Fprintf(&sb, "Make minimal, targeted changes. Do not refactor unrelated code.\n")
 	fmt.Fprintf(&sb, "IMPORTANT: Only modify the specific file(s) referenced in each finding. Do NOT touch any other files.\n")
