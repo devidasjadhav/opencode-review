@@ -6,21 +6,38 @@ import (
 	"github.com/talk/opencode-client/internal/types"
 )
 
-// Port is the interface through which cmd/ interacts with GitHub.
-// Encapsulating owner/repo and authentication into the implementation
-// enables a NoOpClient for --dry-run and mock clients for unit tests
-// without any change to calling code.
-type Port interface {
+// PRPort covers PR lifecycle operations.
+type PRPort interface {
 	EnsureOpenPR(ctx context.Context, repoRoot, baseBranch string) (prNum int, created bool, err error)
 	PostPRReview(ctx context.Context, prNum int, body, verdict string) error
+	MergePR(ctx context.Context, prNum int, strategy string, deleteBranch bool) error
+}
+
+// ValidationPort covers open-issue validation and stale-issue reconciliation.
+type ValidationPort interface {
 	ValidateIssues(ctx context.Context, repoRoot string) ([]IssueValidity, error)
+	CommentOnIssue(ctx context.Context, issueNum int, body string) error
+	CloseIssue(ctx context.Context, issueNum int) error
+}
+
+// IssueFilerPort covers finding-to-issue filing and PR linking.
+type IssueFilerPort interface {
 	FetchIssueIndex(ctx context.Context) (IssueIndex, error)
+	CreateIssue(ctx context.Context, f types.Finding) (int, error)
+	CommentOnIssue(ctx context.Context, issueNum int, body string) error
+	LinkIssuesToPR(ctx context.Context, prNum int, issueNums []int) error
+	CloseIssue(ctx context.Context, issueNum int) error
+}
+
+// Port is the full GitHub interface used by githubContext.
+// It composes the three role interfaces so individual functions can accept
+// the narrowest interface they actually need.
+type Port interface {
+	PRPort
+	ValidationPort
+	IssueFilerPort
+	// Legacy helpers retained for backward compatibility with RealClient/NoOpClient.
 	ExistingIssueTitles(ctx context.Context) (map[string]bool, error)
 	ExistingFingerprints(ctx context.Context) (map[string]int, error)
 	ListOpenIssueSummaries(ctx context.Context) ([]types.IssueSummary, error)
-	CreateIssue(ctx context.Context, f types.Finding) (int, error)
-	CommentOnIssue(ctx context.Context, issueNum int, body string) error
-	CloseIssue(ctx context.Context, issueNum int) error
-	LinkIssuesToPR(ctx context.Context, prNum int, issueNums []int) error
-	MergePR(ctx context.Context, prNum int, strategy string, deleteBranch bool) error
 }

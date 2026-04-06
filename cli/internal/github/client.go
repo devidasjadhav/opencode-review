@@ -107,44 +107,30 @@ func BuildIssueIndex(ctx context.Context, gh *gogithub.Client, owner, repo strin
 
 // ExistingFingerprints returns a map of fingerprint → issue number for open opencode-review issues.
 func ExistingFingerprints(ctx context.Context, gh *gogithub.Client, owner, repo string) (map[string]int, error) {
-	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	idx, err := BuildIssueIndex(ctx, gh, owner, repo)
 	if err != nil {
 		return nil, err
 	}
-	m := make(map[string]int, len(issues))
-	for _, i := range issues {
-		if ms := fingerprintRe.FindStringSubmatch(i.GetBody()); ms != nil {
-			m[ms[1]] = i.GetNumber()
-		}
-	}
-	return m, nil
+	return idx.Fingerprints, nil
 }
 
 // ExistingIssueTitles returns a set of open issue titles for deduplication.
 func ExistingIssueTitles(ctx context.Context, gh *gogithub.Client, owner, repo string) (map[string]bool, error) {
-	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	idx, err := BuildIssueIndex(ctx, gh, owner, repo)
 	if err != nil {
 		return nil, err
 	}
-	seen := make(map[string]bool, len(issues))
-	for _, i := range issues {
-		seen[i.GetTitle()] = true
-	}
-	return seen, nil
+	return idx.Titles, nil
 }
 
 // ListOpenIssueSummaries returns lightweight summaries of all open non-PR issues.
 // Used to populate ReviewContext so the model knows what is already tracked.
 func ListOpenIssueSummaries(ctx context.Context, gh *gogithub.Client, owner, repo string) ([]types.IssueSummary, error) {
-	issues, err := ListOpenIssues(ctx, gh, owner, repo)
+	idx, err := BuildIssueIndex(ctx, gh, owner, repo)
 	if err != nil {
 		return nil, err
 	}
-	summaries := make([]types.IssueSummary, 0, len(issues))
-	for _, i := range issues {
-		summaries = append(summaries, types.IssueSummary{Number: i.GetNumber(), Title: i.GetTitle()})
-	}
-	return summaries, nil
+	return idx.Summaries, nil
 }
 
 // FindingIssueTitle returns the canonical GitHub issue title for a finding.

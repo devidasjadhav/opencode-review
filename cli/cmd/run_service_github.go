@@ -51,7 +51,7 @@ func initGitHubContext(env runEnvironment, cfg runConfig) (githubContext, error)
 	return ghCtx, nil
 }
 
-func ensurePRWithOutput(ctx context.Context, port gh.Port, owner, repo, repoRoot, baseBranch string, required bool) (int, error) {
+func ensurePRWithOutput(ctx context.Context, port gh.PRPort, owner, repo, repoRoot, baseBranch string, required bool) (int, error) {
 	prNum, created, err := port.EnsureOpenPR(ctx, repoRoot, baseBranch)
 	if err != nil {
 		if required {
@@ -68,7 +68,7 @@ func ensurePRWithOutput(ctx context.Context, port gh.Port, owner, repo, repoRoot
 	return prNum, nil
 }
 
-func runIssueValidation(ctx context.Context, validate bool, port gh.Port, repoRoot string) {
+func runIssueValidation(ctx context.Context, validate bool, port gh.ValidationPort, repoRoot string) {
 	if !validate || port == nil {
 		return
 	}
@@ -92,7 +92,7 @@ func printIssueValidation(validations []gh.IssueValidity) {
 	}
 }
 
-func reconcileStaleIssues(ctx context.Context, port gh.Port, validations []gh.IssueValidity) {
+func reconcileStaleIssues(ctx context.Context, port issueCloser, validations []gh.IssueValidity) {
 	for _, v := range validations {
 		if v.Valid {
 			continue
@@ -140,7 +140,7 @@ func maybeMergeOnApprove(env runEnvironment, ghCtx githubContext, cfg runConfig,
 	return true, nil
 }
 
-func fileIssues(ctx context.Context, port gh.Port, prNum int,
+func fileIssues(ctx context.Context, port gh.IssueFilerPort, prNum int,
 	reviewText string, openIssues []int, log *logger.Logger) ([]int, error) {
 
 	findings := review.ParseFindings(reviewText)
@@ -159,7 +159,7 @@ func fileIssues(ctx context.Context, port gh.Port, prNum int,
 	return updatedOpen, nil
 }
 
-func createIssuesForFindings(ctx context.Context, port gh.Port, prNum int,
+func createIssuesForFindings(ctx context.Context, port gh.IssueFilerPort, prNum int,
 	findings []types.Finding, seen map[string]bool, fingerprints map[string]int, openIssues []int, log *logger.Logger) ([]int, []int, error) {
 	var newIssues []int
 	updatedOpen := openIssues
@@ -180,7 +180,7 @@ func createIssuesForFindings(ctx context.Context, port gh.Port, prNum int,
 	return newIssues, updatedOpen, nil
 }
 
-func createIssueForFinding(ctx context.Context, port gh.Port,
+func createIssueForFinding(ctx context.Context, port gh.IssueFilerPort,
 	f types.Finding, seen map[string]bool, fingerprints map[string]int) (int, bool, error) {
 	ghTitle := gh.FindingIssueTitle(f)
 	// Fingerprint check first (more robust), title as fallback.
@@ -200,7 +200,7 @@ func createIssueForFinding(ctx context.Context, port gh.Port,
 	return num, true, nil
 }
 
-func commentIssueWithPRIfNeeded(ctx context.Context, port gh.Port, prNum, issueNum int) {
+func commentIssueWithPRIfNeeded(ctx context.Context, port gh.IssueFilerPort, prNum, issueNum int) {
 	if prNum <= 0 {
 		return
 	}
@@ -228,7 +228,7 @@ func emitIssueSummary(findings []types.Finding, newIssues []int) {
 	}
 }
 
-func linkIssuesIfNeeded(ctx context.Context, port gh.Port, prNum int, newIssues []int) error {
+func linkIssuesIfNeeded(ctx context.Context, port gh.IssueFilerPort, prNum int, newIssues []int) error {
 	if prNum <= 0 || len(newIssues) == 0 {
 		return nil
 	}
@@ -239,7 +239,7 @@ func linkIssuesIfNeeded(ctx context.Context, port gh.Port, prNum int, newIssues 
 	return nil
 }
 
-func mergeAndClose(ctx context.Context, port gh.Port, prNum int,
+func mergeAndClose(ctx context.Context, port gh.PRPort, prNum int,
 	repoRoot, hash, strategy string, deleteBranch bool, log *logger.Logger) error {
 	fmt.Println("\nAll issues resolved — merging PR...")
 	if err := verifyReviewedHead(repoRoot, hash); err != nil {
@@ -264,7 +264,7 @@ func verifyReviewedHead(repoRoot, hash string) error {
 	return nil
 }
 
-func closeRunIssues(ctx context.Context, port gh.Port, openIssues []int, log *logger.Logger) error {
+func closeRunIssues(ctx context.Context, port gh.IssueFilerPort, openIssues []int, log *logger.Logger) error {
 	closeNums := map[int]bool{}
 	for _, n := range openIssues {
 		closeNums[n] = true
@@ -299,7 +299,13 @@ type issueCloseOptions struct {
 	onClosed        func(issueNum int)
 }
 
-func closeIssueWithReporting(ctx context.Context, port gh.Port, issueNum int, opts issueCloseOptions) error {
+// issueCloser is the minimal interface needed to close an issue with an optional comment.
+type issueCloser interface {
+	CommentOnIssue(ctx context.Context, issueNum int, body string) error
+	CloseIssue(ctx context.Context, issueNum int) error
+}
+
+func closeIssueWithReporting(ctx context.Context, port issueCloser, issueNum int, opts issueCloseOptions) error {
 	if opts.preCloseComment != "" {
 		if err := port.CommentOnIssue(ctx, issueNum, opts.preCloseComment); err != nil && opts.onCommentError != nil {
 			opts.onCommentError(issueNum, err)
