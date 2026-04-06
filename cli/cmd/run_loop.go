@@ -322,7 +322,7 @@ func runAutoFixIfNeeded(env runEnvironment, selected types.ModelInfo, cfg runCon
 		return false, nil, nil
 	}
 	fmt.Printf("\n--- Auto-fixing %d finding(s) ---\n", len(fixable))
-	n, changedPaths, err := occ.RunFix(env.client, env.ctx, env.repoRoot, selected, fixable, iteration, occ.NewGitFixPersister(), cfg.lspEnabled)
+	n, changedPaths, err := occ.RunFix(env.client, env.ctx, env.repoRoot, selected, fixable, iteration, env.fixPersister, cfg.lspEnabled)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: auto-fix failed: %v\n", err)
 		logEvent(env.log, map[string]any{"event": "auto_fix_error", "error": err.Error(), "iteration": iteration})

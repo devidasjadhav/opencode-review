@@ -19,10 +19,11 @@ import (
 )
 
 type runEnvironment struct {
-	ctx      context.Context
-	repoRoot string
-	client   *sdk.Client
-	log      *logger.Logger
+	ctx          context.Context
+	repoRoot     string
+	client       *sdk.Client
+	log          *logger.Logger
+	fixPersister occ.FixPersister
 }
 
 func initEnvironment(cfg runConfig) (runEnvironment, error) {
@@ -46,10 +47,11 @@ func initEnvironment(cfg runConfig) (runEnvironment, error) {
 		checkLSPEnvironment()
 	}
 	return runEnvironment{
-		ctx:      context.Background(),
-		repoRoot: repoRoot,
-		client:   occ.NewClient(cfg.serverURL),
-		log:      logger.New(repoRoot),
+		ctx:          context.Background(),
+		repoRoot:     repoRoot,
+		client:       occ.NewClient(cfg.serverURL),
+		log:          logger.New(repoRoot),
+		fixPersister: occ.NewGitFixPersister(),
 	}, nil
 }
 
